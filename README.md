@@ -4,10 +4,10 @@ A CLI tool for capturing and comparing AWS Lambda invocation logs across deploym
 
 ## Install
 
-Requires Go 1.21+.
+Requires Go 1.25.0+.
 
 ```bash
-go build -o lambda-deploy-log-compare .
+go build
 ```
 
 ## Quick Start
