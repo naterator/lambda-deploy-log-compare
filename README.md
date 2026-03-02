@@ -4,10 +4,12 @@ A CLI tool for capturing and comparing AWS Lambda invocation logs across deploym
 
 ## Install
 
-Requires Go 1.25.0+.
+Download a binary for your OS from [release page](https://github.com/naterator/lambda-deploy-log-compare/releases). Put the executable in a directory in `$PATH`.
+
+Or you can install by building from source directly as follows. Go 1.25 or later is necessary.
 
 ```bash
-go build
+go install github.com/naterator/lambda-deploy-log-compare@latest
 ```
 
 ## Quick Start
