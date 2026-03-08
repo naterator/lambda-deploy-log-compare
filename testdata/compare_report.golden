@@ -1,0 +1,43 @@
+=== Comparison: test-func ===
+  Baseline: testdata/compare_baseline.json (label: baseline, captured: 2026-02-25T10:00:00Z)
+  New:      testdata/compare_new.json (label: new, captured: 2026-02-25T12:00:00Z)
+
+--- BASELINE: test-func [baseline] (log group: /aws/lambda/test-func) ---
+  Invocations captured: 2
+  Errors: 1
+  Recent invocations:
+    2026-02-25T10:01:00Z  dur=100 ms  peak_mem=80 MB  mem_size=128 MB
+    2026-02-25T10:00:00Z  dur=oops  peak_mem=bad  mem_size=128 MB [ERROR]
+
+--- NEW: test-func [new] (log group: /aws/lambda/test-func) ---
+  Invocations captured: 2
+  Errors: 1
+  Recent invocations:
+    2026-02-25T12:01:00Z  dur=110 ms  peak_mem=90 MB  mem_size=128 MB
+    2026-02-25T12:00:00Z  dur=120 ms  peak_mem=95 MB  mem_size=128 MB [ERROR]
+
+=== Error Comparison ===
+  Baseline errors: 1 / 2 invocations
+  New errors:      1 / 2 invocations
+  Error count unchanged
+
+  *** NEW error patterns in new deployment: ***
+    - panic: boom
+
+  Error patterns no longer appearing:
+    - connection error
+
+=== Duration Comparison ===
+  Baseline: min=100.0ms avg=100.0ms p50=100.0ms p90=100.0ms max=100.0ms (n=1, ignored=1 malformed)
+  New     : min=110.0ms avg=115.0ms p50=120.0ms p90=120.0ms max=120.0ms (n=2, ignored=0 malformed)
+
+=== Memory Usage Comparison ===
+  Baseline: min=80MB avg=80MB max=80MB (n=1, ignored=1 malformed)
+  New     : min=90MB avg=92MB max=95MB (n=2, ignored=0 malformed)
+
+=== Log Pattern Diff ===
+  New log patterns (only in new deployment):
+    + feature flag enabled
+    + panic: boom
+  Gone log patterns (only in baseline):
+    - connection error

@@ -1,0 +1,37 @@
+{
+  "function_name": "test-func",
+  "log_group": "/aws/lambda/test-func",
+  "captured_at": "2026-02-25T10:00:00Z",
+  "label": "baseline",
+  "invocations": [
+    {
+      "request_id": "req-1",
+      "timestamp": "2026-02-25T10:01:00Z",
+      "duration": "100 ms",
+      "billed_ms": "100 ms",
+      "memory_size_mb": "128 MB",
+      "max_memory_used_mb": "80 MB",
+      "is_error": false,
+      "log_lines": [
+        "starting",
+        "done"
+      ]
+    },
+    {
+      "request_id": "req-2",
+      "timestamp": "2026-02-25T10:00:00Z",
+      "duration": "oops",
+      "billed_ms": "100 ms",
+      "memory_size_mb": "128 MB",
+      "max_memory_used_mb": "bad",
+      "is_error": true,
+      "error_lines": [
+        "connection error"
+      ],
+      "log_lines": [
+        "starting",
+        "connection error"
+      ]
+    }
+  ]
+}

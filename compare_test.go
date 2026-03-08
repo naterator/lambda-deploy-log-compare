@@ -1,8 +1,8 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,12 +168,12 @@ func TestRunCompare(t *testing.T) {
 		Label:        "baseline",
 		Invocations: []InvocationRecord{
 			{
-				RequestID: "req-1",
-				Timestamp: "2026-02-25T10:00:00Z",
-				Duration:  "100 ms",
-				MaxMemMB:  "85 MB",
-				IsError:   false,
-				LogLines:  []string{"starting"},
+				RequestID:       "req-1",
+				Timestamp:       "2026-02-25T10:00:00Z",
+				Duration:        "100 ms",
+				MaxMemoryUsedMB: "85 MB",
+				IsError:         false,
+				LogLines:        []string{"starting"},
 			},
 		},
 	}
@@ -184,13 +184,13 @@ func TestRunCompare(t *testing.T) {
 		Label:        "new",
 		Invocations: []InvocationRecord{
 			{
-				RequestID:  "req-2",
-				Timestamp:  "2026-02-25T12:00:00Z",
-				Duration:   "120 ms",
-				MaxMemMB:   "90 MB",
-				IsError:    true,
-				ErrorLines: []string{"connection error"},
-				LogLines:   []string{"starting", "connection error"},
+				RequestID:       "req-2",
+				Timestamp:       "2026-02-25T12:00:00Z",
+				Duration:        "120 ms",
+				MaxMemoryUsedMB: "90 MB",
+				IsError:         true,
+				ErrorLines:      []string{"connection error"},
+				LogLines:        []string{"starting", "connection error"},
 			},
 		},
 	}
@@ -254,11 +254,11 @@ func TestComparisonWarnings(t *testing.T) {
 
 func TestFormatInvocationSummary(t *testing.T) {
 	inv := InvocationRecord{
-		Timestamp: "2026-02-25T12:00:00Z",
-		Duration:  "120 ms",
-		MaxMemMB:  "90 MB",
-		MemUsedMB: "128 MB",
-		IsError:   true,
+		Timestamp:       "2026-02-25T12:00:00Z",
+		Duration:        "120 ms",
+		MaxMemoryUsedMB: "90 MB",
+		MemorySizeMB:    "128 MB",
+		IsError:         true,
 	}
 
 	got := formatInvocationSummary(inv)
@@ -274,12 +274,12 @@ func TestPrintSnapshotSummary_ShowsMostRecentInvocationsFirst(t *testing.T) {
 		LogGroup:     "/aws/lambda/test-func",
 		Label:        "baseline",
 		Invocations: []InvocationRecord{
-			{Timestamp: "2026-02-25T10:06:00Z", Duration: "60 ms", MaxMemMB: "96 MB", MemUsedMB: "128 MB"},
-			{Timestamp: "2026-02-25T10:05:00Z", Duration: "50 ms", MaxMemMB: "95 MB", MemUsedMB: "128 MB"},
-			{Timestamp: "2026-02-25T10:04:00Z", Duration: "40 ms", MaxMemMB: "94 MB", MemUsedMB: "128 MB"},
-			{Timestamp: "2026-02-25T10:03:00Z", Duration: "30 ms", MaxMemMB: "93 MB", MemUsedMB: "128 MB"},
-			{Timestamp: "2026-02-25T10:02:00Z", Duration: "20 ms", MaxMemMB: "92 MB", MemUsedMB: "128 MB"},
-			{Timestamp: "2026-02-25T10:01:00Z", Duration: "10 ms", MaxMemMB: "91 MB", MemUsedMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:06:00Z", Duration: "60 ms", MaxMemoryUsedMB: "96 MB", MemorySizeMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:05:00Z", Duration: "50 ms", MaxMemoryUsedMB: "95 MB", MemorySizeMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:04:00Z", Duration: "40 ms", MaxMemoryUsedMB: "94 MB", MemorySizeMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:03:00Z", Duration: "30 ms", MaxMemoryUsedMB: "93 MB", MemorySizeMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:02:00Z", Duration: "20 ms", MaxMemoryUsedMB: "92 MB", MemorySizeMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:01:00Z", Duration: "10 ms", MaxMemoryUsedMB: "91 MB", MemorySizeMB: "128 MB"},
 		},
 	}
 
@@ -343,17 +343,19 @@ func TestParseDurationMs(t *testing.T) {
 	tests := []struct {
 		input string
 		want  float64
+		ok    bool
 	}{
-		{"123.45 ms", 123.45},
-		{"0.5ms", 0.5},
-		{"  200 ms  ", 200.0},
-		{"", 0.0},
+		{"123.45 ms", 123.45, true},
+		{"0.5ms", 0.5, true},
+		{"  200 ms  ", 200.0, true},
+		{"", 0.0, false},
+		{"abc ms", 0.0, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got := parseDurationMs(tt.input)
-			if got != tt.want {
-				t.Errorf("parseDurationMs(%q) = %f, want %f", tt.input, got, tt.want)
+			got, ok := parseDurationMs(tt.input)
+			if ok != tt.ok || got != tt.want {
+				t.Errorf("parseDurationMs(%q) = (%f, %t), want (%f, %t)", tt.input, got, ok, tt.want, tt.ok)
 			}
 		})
 	}
@@ -362,48 +364,148 @@ func TestParseDurationMs(t *testing.T) {
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 
-	oldStdout := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe error: %v", err)
-	}
-	os.Stdout = w
-
-	defer func() {
-		os.Stdout = oldStdout
-	}()
+	oldStdout := stdout
+	var buf bytes.Buffer
+	stdout = &buf
+	defer func() { stdout = oldStdout }()
 
 	fn()
-
-	if err := w.Close(); err != nil {
-		t.Fatalf("stdout writer close error: %v", err)
-	}
-	output, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("stdout read error: %v", err)
-	}
-	if err := r.Close(); err != nil {
-		t.Fatalf("stdout reader close error: %v", err)
-	}
-	return string(output)
+	return buf.String()
 }
 
 func TestParseMemMB(t *testing.T) {
 	tests := []struct {
 		input string
 		want  float64
+		ok    bool
 	}{
-		{"128 MB", 128.0},
-		{"85MB", 85.0},
-		{"  256 MB  ", 256.0},
-		{"", 0.0},
+		{"128 MB", 128.0, true},
+		{"85MB", 85.0, true},
+		{"  256 MB  ", 256.0, true},
+		{"", 0.0, false},
+		{"oops", 0.0, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got := parseMemMB(tt.input)
-			if got != tt.want {
-				t.Errorf("parseMemMB(%q) = %f, want %f", tt.input, got, tt.want)
+			got, ok := parseMemMB(tt.input)
+			if ok != tt.ok || got != tt.want {
+				t.Errorf("parseMemMB(%q) = (%f, %t), want (%f, %t)", tt.input, got, ok, tt.want, tt.ok)
 			}
 		})
+	}
+}
+
+func TestLoadSnapshot_BackwardCompatibleMemoryFields(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "legacy.json")
+	data := []byte(`{
+  "function_name": "test-func",
+  "log_group": "/aws/lambda/test-func",
+  "captured_at": "2026-02-25T10:00:00Z",
+  "label": "legacy",
+  "invocations": [
+    {
+      "request_id": "req-1",
+      "timestamp": "2026-02-25T10:00:00Z",
+      "duration": "100 ms",
+      "billed_ms": "100 ms",
+      "mem_used_mb": "128 MB",
+      "max_mem_mb": "85 MB",
+      "is_error": false,
+      "log_lines": ["hello"]
+    }
+  ]
+}`)
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadSnapshot(tmpFile)
+	if err != nil {
+		t.Fatalf("loadSnapshot error: %v", err)
+	}
+	if got := loaded.Invocations[0].MemorySizeMB; got != "128 MB" {
+		t.Fatalf("MemorySizeMB = %q, want %q", got, "128 MB")
+	}
+	if got := loaded.Invocations[0].MaxMemoryUsedMB; got != "85 MB" {
+		t.Fatalf("MaxMemoryUsedMB = %q, want %q", got, "85 MB")
+	}
+}
+
+func TestRunCompare_StrictMismatchFails(t *testing.T) {
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "a.json")
+	fileB := filepath.Join(dir, "b.json")
+	for _, pair := range []struct {
+		path string
+		snap Snapshot
+	}{
+		{fileA, Snapshot{FunctionName: "func-a", LogGroup: "/aws/lambda/func-a"}},
+		{fileB, Snapshot{FunctionName: "func-b", LogGroup: "/aws/lambda/func-b"}},
+	} {
+		data, err := json.MarshalIndent(pair.snap, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(pair.path, data, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err := runCompareWithOptions(fileA, fileB, CompareOptions{Strict: true})
+	if err == nil {
+		t.Fatal("expected strict compare error")
+	}
+	if !strings.Contains(err.Error(), "strict comparison failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestPrintDurationStats_IgnoresMalformedValues(t *testing.T) {
+	snap := Snapshot{
+		Invocations: []InvocationRecord{
+			{Duration: "100 ms"},
+			{Duration: "oops"},
+			{Duration: "50 ms"},
+		},
+	}
+
+	output := captureStdout(t, func() {
+		printDurationStats("Baseline", snap)
+	})
+	if !strings.Contains(output, "ignored=1 malformed") {
+		t.Fatalf("output missing malformed count: %s", output)
+	}
+}
+
+func TestPrintMemoryStats_IgnoresMalformedValues(t *testing.T) {
+	snap := Snapshot{
+		Invocations: []InvocationRecord{
+			{MaxMemoryUsedMB: "90 MB"},
+			{MaxMemoryUsedMB: "bad"},
+			{MaxMemoryUsedMB: "80 MB"},
+		},
+	}
+
+	output := captureStdout(t, func() {
+		printMemoryStats("Baseline", snap)
+	})
+	if !strings.Contains(output, "ignored=1 malformed") {
+		t.Fatalf("output missing malformed count: %s", output)
+	}
+}
+
+func TestRunCompare_GoldenOutput(t *testing.T) {
+	output := captureStdout(t, func() {
+		if err := runCompare("testdata/compare_baseline.json", "testdata/compare_new.json"); err != nil {
+			t.Fatalf("runCompare error: %v", err)
+		}
+	})
+
+	want, err := os.ReadFile("testdata/compare_report.golden")
+	if err != nil {
+		t.Fatalf("failed to read golden file: %v", err)
+	}
+	if output != string(want) {
+		t.Fatalf("compare output mismatch\n--- got ---\n%s\n--- want ---\n%s", output, string(want))
 	}
 }

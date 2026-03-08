@@ -9,72 +9,100 @@ import (
 
 func parseInvocations(events []types.OutputLogEvent) []InvocationSummary {
 	type invocationBuilder struct {
-		requestID  string
-		startTime  time.Time
-		duration   string
-		billedMs   string
-		memUsedMB  string
-		maxMemMB   string
-		isError    bool
-		errorLines []string
-		logLines   []string
-		hasReport  bool
+		requestID       string
+		startTime       time.Time
+		duration        string
+		billedMs        string
+		memorySizeMB    string
+		maxMemoryUsedMB string
+		isError         bool
+		errorLines      []string
+		logLines        []string
+		hasReport       bool
 	}
 
 	builders := make(map[string]*invocationBuilder)
 	var order []string
+	currentReqID := ""
+
+	ensureBuilder := func(reqID string, ts time.Time) *invocationBuilder {
+		if reqID == "" {
+			return nil
+		}
+		b, ok := builders[reqID]
+		if !ok {
+			b = &invocationBuilder{requestID: reqID, startTime: ts}
+			builders[reqID] = b
+			order = append(order, reqID)
+			return b
+		}
+		if b.startTime.IsZero() || ts.Before(b.startTime) {
+			b.startTime = ts
+		}
+		return b
+	}
+
+	appendLogLine := func(b *invocationBuilder, msg string) {
+		if b == nil {
+			return
+		}
+		trimmed := strings.TrimSpace(msg)
+		if trimmed == "" {
+			return
+		}
+		b.logLines = append(b.logLines, trimmed)
+		if lineLooksLikeError(trimmed) {
+			b.isError = true
+			b.errorLines = append(b.errorLines, trimmed)
+		}
+	}
+
+	builderForLog := func(msg string, ts time.Time) *invocationBuilder {
+		if reqID := extractInlineRequestID(msg); reqID != "" {
+			return ensureBuilder(reqID, ts)
+		}
+		if currentReqID != "" {
+			return ensureBuilder(currentReqID, ts)
+		}
+		if len(order) == 0 {
+			return nil
+		}
+		return builders[order[len(order)-1]]
+	}
 
 	for _, ev := range events {
 		if ev.Message == nil || ev.Timestamp == nil {
 			continue
 		}
-		msg := *ev.Message
+		msg := strings.TrimSpace(*ev.Message)
 		ts := time.UnixMilli(*ev.Timestamp)
 
 		switch {
 		case strings.HasPrefix(msg, "START RequestId: "):
 			reqID := extractRequestID(msg, "START RequestId: ")
-			if _, ok := builders[reqID]; !ok {
-				builders[reqID] = &invocationBuilder{requestID: reqID, startTime: ts}
-				order = append(order, reqID)
+			if b := ensureBuilder(reqID, ts); b != nil {
+				b.startTime = ts
 			}
+			currentReqID = reqID
 
 		case strings.HasPrefix(msg, "END RequestId: "):
-			// nothing extra needed
+			currentReqID = extractRequestID(msg, "END RequestId: ")
 
 		case strings.HasPrefix(msg, "REPORT RequestId: "):
 			reqID := extractRequestID(msg, "REPORT RequestId: ")
-			b, ok := builders[reqID]
-			if !ok {
-				b = &invocationBuilder{requestID: reqID, startTime: ts}
-				builders[reqID] = b
-				order = append(order, reqID)
+			b := ensureBuilder(reqID, ts)
+			if b == nil {
+				continue
 			}
 			b.hasReport = true
 			b.duration = extractField(msg, "Duration: ")
 			b.billedMs = extractField(msg, "Billed Duration: ")
-			b.memUsedMB = extractField(msg, "Memory Size: ")
-			b.maxMemMB = extractField(msg, "Max Memory Used: ")
+			b.memorySizeMB = extractField(msg, "Memory Size: ")
+			b.maxMemoryUsedMB = extractField(msg, "Max Memory Used: ")
+			currentReqID = reqID
 
 		default:
-			if len(order) > 0 {
-				currentReqID := order[len(order)-1]
-				b := builders[currentReqID]
-				trimmed := strings.TrimSpace(msg)
-				if trimmed == "" {
-					break
-				}
-				b.logLines = append(b.logLines, trimmed)
-				lower := strings.ToLower(trimmed)
-				if strings.Contains(lower, "error") ||
-					strings.Contains(lower, "panic") ||
-					strings.Contains(lower, "fatal") ||
-					strings.Contains(lower, "traceback") ||
-					strings.Contains(lower, "exception") {
-					b.isError = true
-					b.errorLines = append(b.errorLines, trimmed)
-				}
-			}
+			appendLogLine(builderForLog(msg, ts), msg)
 		}
 	}
 
@@ -85,15 +113,15 @@ func parseInvocations(events []types.OutputLogEvent) []InvocationSummary {
 			continue
 		}
 		results = append(results, InvocationSummary{
-			RequestID:  b.requestID,
-			StartTime:  b.startTime,
-			Duration:   b.duration,
-			BilledMs:   b.billedMs,
-			MemUsedMB:  b.memUsedMB,
-			MaxMemMB:   b.maxMemMB,
-			IsError:    b.isError,
-			ErrorLines: b.errorLines,
-			LogLines:   b.logLines,
+			RequestID:       b.requestID,
+			StartTime:       b.startTime,
+			Duration:        b.duration,
+			BilledMs:        b.billedMs,
+			MemorySizeMB:    b.memorySizeMB,
+			MaxMemoryUsedMB: b.maxMemoryUsedMB,
+			IsError:         b.isError,
+			ErrorLines:      b.errorLines,
+			LogLines:        b.logLines,
 		})
 	}
 	return results
@@ -119,6 +147,77 @@ func extractField(report, fieldName string) string {
 		return strings.TrimSpace(rest)
 	}
 	return strings.TrimSpace(rest[:end])
+}
+
+func extractInlineRequestID(line string) string {
+	for _, prefix := range []string{"RequestId: ", "RequestID: ", "requestId: ", "requestID: "} {
+		if idx := strings.Index(line, prefix); idx >= 0 {
+			return extractRequestID(line[idx:], prefix)
+		}
+	}
+	return ""
+}
+
+func lineLooksLikeError(line string) bool {
+	lower := strings.ToLower(strings.TrimSpace(line))
+	if lower == "" || isBenignErrorLine(lower) {
+		return false
+	}
+
+	for _, token := range []string{
+		"[error]",
+		"panic:",
+		"fatal:",
+		"fatal ",
+		"traceback",
+		"exception",
+		"runtime.exiterror",
+		"task timed out after",
+		"process exited before completing request",
+	} {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+
+	for _, token := range []string{
+		" level=error",
+		"\tlevel=error",
+		"\"level\":\"error\"",
+		"\"level\": \"error\"",
+		" error:",
+		" error ",
+	} {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+
+	return strings.HasPrefix(lower, "error:") ||
+		strings.HasPrefix(lower, "error ") ||
+		strings.HasSuffix(lower, " error")
+}
+
+func isBenignErrorLine(lower string) bool {
+	for _, phrase := range []string{
+		"no error",
+		"no errors",
+		"without error",
+		"without errors",
+		"error_count",
+		"error count",
+		"errors=0",
+		"error=0",
+		"errors: 0",
+		"error: 0",
+		"error rate",
+		"error budget",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeLogLine(line string) string {

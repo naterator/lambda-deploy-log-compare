@@ -167,11 +167,11 @@ func TestParseInvocations(t *testing.T) {
 	if inv.Duration != "150.5 ms" {
 		t.Errorf("Duration = %q, want %q", inv.Duration, "150.5 ms")
 	}
-	if inv.MemUsedMB != "128 MB" {
-		t.Errorf("MemUsedMB = %q, want %q", inv.MemUsedMB, "128 MB")
+	if inv.MemorySizeMB != "128 MB" {
+		t.Errorf("MemorySizeMB = %q, want %q", inv.MemorySizeMB, "128 MB")
 	}
-	if inv.MaxMemMB != "85 MB" {
-		t.Errorf("MaxMemMB = %q, want %q", inv.MaxMemMB, "85 MB")
+	if inv.MaxMemoryUsedMB != "85 MB" {
+		t.Errorf("MaxMemoryUsedMB = %q, want %q", inv.MaxMemoryUsedMB, "85 MB")
 	}
 	if inv.IsError {
 		t.Error("expected no error")
@@ -267,5 +267,50 @@ func TestParseInvocations_NilMessageSkipped(t *testing.T) {
 	got := parseInvocations(events)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 invocation, got %d", len(got))
+	}
+}
+
+func TestParseInvocations_AssignsInlineRequestIDLogsToCorrectInvocation(t *testing.T) {
+	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+
+	events := []types.OutputLogEvent{
+		{Message: aws.String("START RequestId: req-a Version: $LATEST"), Timestamp: aws.Int64(ts)},
+		{Message: aws.String("START RequestId: req-b Version: $LATEST"), Timestamp: aws.Int64(ts + 100)},
+		{Message: aws.String("runtime extension RequestId: req-a flushed telemetry"), Timestamp: aws.Int64(ts + 150)},
+		{Message: aws.String("REPORT RequestId: req-a\tDuration: 10 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 50 MB"), Timestamp: aws.Int64(ts + 200)},
+		{Message: aws.String("REPORT RequestId: req-b\tDuration: 20 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 60 MB"), Timestamp: aws.Int64(ts + 300)},
+	}
+
+	got := parseInvocations(events)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 invocations, got %d", len(got))
+	}
+	if len(got[0].LogLines) != 1 || got[0].LogLines[0] != "runtime extension RequestId: req-a flushed telemetry" {
+		t.Fatalf("req-a LogLines = %v, want runtime line attached to req-a", got[0].LogLines)
+	}
+	if len(got[1].LogLines) != 0 {
+		t.Fatalf("req-b LogLines = %v, want none", got[1].LogLines)
+	}
+}
+
+func TestParseInvocations_IgnoresBenignErrorPhrases(t *testing.T) {
+	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+
+	events := []types.OutputLogEvent{
+		{Message: aws.String("START RequestId: req-ok Version: $LATEST"), Timestamp: aws.Int64(ts)},
+		{Message: aws.String("error_count=0"), Timestamp: aws.Int64(ts + 10)},
+		{Message: aws.String("no errors detected in prior batch"), Timestamp: aws.Int64(ts + 20)},
+		{Message: aws.String("REPORT RequestId: req-ok\tDuration: 5 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 40 MB"), Timestamp: aws.Int64(ts + 100)},
+	}
+
+	got := parseInvocations(events)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 invocation, got %d", len(got))
+	}
+	if got[0].IsError {
+		t.Fatalf("expected benign lines not to mark invocation as error: %+v", got[0])
+	}
+	if len(got[0].ErrorLines) != 0 {
+		t.Fatalf("ErrorLines = %v, want none", got[0].ErrorLines)
 	}
 }

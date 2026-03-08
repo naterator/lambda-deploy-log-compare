@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -51,15 +52,15 @@ func TestLogGroupForFunction(t *testing.T) {
 func TestToRecord(t *testing.T) {
 	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC)
 	inv := InvocationSummary{
-		RequestID:  "req-123",
-		StartTime:  ts,
-		Duration:   "100 ms",
-		BilledMs:   "200 ms",
-		MemUsedMB:  "128 MB",
-		MaxMemMB:   "256 MB",
-		IsError:    true,
-		ErrorLines: []string{"panic: something"},
-		LogLines:   []string{"starting", "panic: something"},
+		RequestID:       "req-123",
+		StartTime:       ts,
+		Duration:        "100 ms",
+		BilledMs:        "200 ms",
+		MemorySizeMB:    "128 MB",
+		MaxMemoryUsedMB: "256 MB",
+		IsError:         true,
+		ErrorLines:      []string{"panic: something"},
+		LogLines:        []string{"starting", "panic: something"},
 	}
 	rec := toRecord(inv)
 	if rec.RequestID != "req-123" {
@@ -70,6 +71,9 @@ func TestToRecord(t *testing.T) {
 	}
 	if rec.Duration != "100 ms" || rec.BilledMs != "200 ms" {
 		t.Error("duration/billed fields mismatch")
+	}
+	if rec.MemorySizeMB != "128 MB" || rec.MaxMemoryUsedMB != "256 MB" {
+		t.Error("memory fields mismatch")
 	}
 	if !rec.IsError || len(rec.ErrorLines) != 1 {
 		t.Error("error fields mismatch")
@@ -427,5 +431,78 @@ func TestRunCapture_InvalidArguments(t *testing.T) {
 				t.Fatalf("runCapture error = %q, want %q", err.Error(), tt.want)
 			}
 		})
+	}
+}
+
+func TestRunCapture_PaginatesStreamsUntilItFindsOlderInvocations(t *testing.T) {
+	base := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+	var describeCalls int
+
+	mock := &mockLogsClient{
+		describeLogStreamsFn: func(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
+			describeCalls++
+			makeStream := func(start, end int) []types.LogStream {
+				streams := make([]types.LogStream, 0, end-start+1)
+				for i := start; i <= end; i++ {
+					streams = append(streams, types.LogStream{LogStreamName: aws.String(fmt.Sprintf("stream-%03d", i))})
+				}
+				return streams
+			}
+
+			if params.NextToken == nil {
+				return &cloudwatchlogs.DescribeLogStreamsOutput{
+					LogStreams: makeStream(1, 50),
+					NextToken:  aws.String("page-2"),
+				}, nil
+			}
+			return &cloudwatchlogs.DescribeLogStreamsOutput{
+				LogStreams: makeStream(51, 60),
+			}, nil
+		},
+		getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+			name := *params.LogStreamName
+			if name < "stream-056" {
+				return &cloudwatchlogs.GetLogEventsOutput{NextForwardToken: aws.String("done")}, nil
+			}
+
+			streamIndex := 0
+			fmt.Sscanf(name, "stream-%03d", &streamIndex)
+			ts := base + int64((61-streamIndex)*1000)
+			reqID := fmt.Sprintf("req-%03d", streamIndex)
+			return &cloudwatchlogs.GetLogEventsOutput{
+				Events: []types.OutputLogEvent{
+					{Message: aws.String("START RequestId: " + reqID + " Version: $LATEST"), Timestamp: aws.Int64(ts)},
+					{Message: aws.String(fmt.Sprintf("REPORT RequestId: %s\tDuration: %d ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB", reqID, streamIndex)), Timestamp: aws.Int64(ts + 100)},
+				},
+				NextForwardToken: aws.String("done"),
+			}, nil
+		},
+	}
+
+	outDir := t.TempDir()
+	if err := runCapture(mock, "test-func", "/aws/lambda/test-func", 3, 1, "older", outDir); err != nil {
+		t.Fatalf("runCapture error: %v", err)
+	}
+	if describeCalls != 2 {
+		t.Fatalf("DescribeLogStreams calls = %d, want 2", describeCalls)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "test-func_older.json"))
+	if err != nil {
+		t.Fatalf("failed to read output file: %v", err)
+	}
+
+	var snap Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatalf("failed to unmarshal snapshot: %v", err)
+	}
+	got := []string{
+		snap.Invocations[0].RequestID,
+		snap.Invocations[1].RequestID,
+		snap.Invocations[2].RequestID,
+	}
+	want := []string{"req-057", "req-058", "req-059"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("request IDs = %v, want %v", got, want)
 	}
 }

@@ -35,54 +35,71 @@ func runCapture(client LogsClient, funcName, logGroup string, count, offset int,
 	needed := offset + count
 
 	if offset > 0 {
-		fmt.Printf("Capturing logs for %s (log group: %s, offset: %d, count: %d) ...\n", funcName, logGroup, offset, count)
+		fmt.Fprintf(stdout, "Capturing logs for %s (log group: %s, offset: %d, count: %d) ...\n", funcName, logGroup, offset, count)
 	} else {
-		fmt.Printf("Capturing logs for %s (log group: %s) ...\n", funcName, logGroup)
+		fmt.Fprintf(stdout, "Capturing logs for %s (log group: %s) ...\n", funcName, logGroup)
 	}
 
-	// Fetch log streams ordered by last event time (most recent first).
-	streamCtx, streamCancel := context.WithTimeout(ctx, 2*time.Minute)
-	streams, err := fetchLogStreams(streamCtx, client, logGroup, needed+50)
-	streamCancel()
-	if err != nil {
-		return fmt.Errorf("describe-log-streams: %w", err)
-	}
-	if len(streams) == 0 {
-		fmt.Printf("  No log streams found for %s\n", logGroup)
-		return nil
-	}
-	fmt.Printf("  Found %d log streams\n", len(streams))
-
-	// Collect invocations from streams until we have enough.
 	var allInvocations []InvocationSummary
-	for i, stream := range streams {
-		if i > 0 && i%20 == 0 {
-			fmt.Printf("  Processing stream %d/%d (collected %d invocations so far) ...\n", i, len(streams), len(allInvocations))
-		}
+	var streamCount int
+	var processedStreams int
+	var nextToken *string
 
-		evCtx, evCancel := context.WithTimeout(ctx, 30*time.Second)
-		events, err := fetchLogEvents(evCtx, client, logGroup, *stream.LogStreamName)
-		evCancel()
+	for len(allInvocations) < needed {
+		streamCtx, streamCancel := context.WithTimeout(ctx, 2*time.Minute)
+		streams, newToken, err := fetchLogStreamPage(streamCtx, client, logGroup, 50, nextToken)
+		streamCancel()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "  Warning: failed to get events from stream %s: %v\n", *stream.LogStreamName, err)
-			continue
+			return fmt.Errorf("describe-log-streams: %w", err)
+		}
+		if len(streams) == 0 {
+			break
 		}
 
-		invocations := parseInvocations(events)
-		allInvocations = append(allInvocations, invocations...)
+		startIdx := streamCount + 1
+		streamCount += len(streams)
+		fmt.Fprintf(stdout, "  Scanning streams %d-%d (collected %d invocations so far) ...\n", startIdx, streamCount, len(allInvocations))
 
-		if len(allInvocations) >= needed {
-			fmt.Printf("  Collected enough invocations (%d >= %d), stopping early at stream %d/%d\n", len(allInvocations), needed, i+1, len(streams))
+		for _, stream := range streams {
+			if stream.LogStreamName == nil {
+				continue
+			}
+			processedStreams++
+
+			evCtx, evCancel := context.WithTimeout(ctx, 30*time.Second)
+			events, err := fetchLogEvents(evCtx, client, logGroup, *stream.LogStreamName)
+			evCancel()
+			if err != nil {
+				fmt.Fprintf(stderr, "  Warning: failed to get events from stream %s: %v\n", *stream.LogStreamName, err)
+				continue
+			}
+
+			invocations := parseInvocations(events)
+			allInvocations = append(allInvocations, invocations...)
+
+			if len(allInvocations) >= needed {
+				fmt.Fprintf(stdout, "  Collected enough invocations (%d >= %d), stopping early after stream %d\n", len(allInvocations), needed, processedStreams)
+				break
+			}
+		}
+
+		nextToken = newToken
+		if nextToken == nil {
 			break
 		}
 	}
+	if streamCount == 0 {
+		fmt.Fprintf(stdout, "  No log streams found for %s\n", logGroup)
+		return nil
+	}
+	fmt.Fprintf(stdout, "  Scanned %d log streams\n", streamCount)
 
 	selectedInvocations := selectInvocations(allInvocations, count, offset)
 	if offset > 0 && len(selectedInvocations) == 0 {
-		fmt.Printf("  Warning: only found %d invocations, but offset is %d — no invocations to capture\n", len(allInvocations), offset)
+		fmt.Fprintf(stdout, "  Warning: only found %d invocations, but offset is %d - no invocations to capture\n", len(allInvocations), offset)
 	}
 
-	fmt.Printf("  Selected %d invocations\n", len(selectedInvocations))
+	fmt.Fprintf(stdout, "  Selected %d invocations\n", len(selectedInvocations))
 
 	var records []InvocationRecord
 	for _, inv := range selectedInvocations {
@@ -109,8 +126,22 @@ func runCapture(client LogsClient, funcName, logGroup string, count, offset int,
 		return fmt.Errorf("write snapshot: %w", err)
 	}
 
-	fmt.Printf("  Wrote snapshot to %s (%d invocations)\n", outPath, len(records))
+	fmt.Fprintf(stdout, "  Wrote snapshot to %s (%d invocations)\n", outPath, len(records))
 	return nil
+}
+
+func fetchLogStreamPage(ctx context.Context, client LogsClient, logGroup string, limit int32, nextToken *string) ([]types.LogStream, *string, error) {
+	out, err := client.DescribeLogStreams(ctx, &cloudwatchlogs.DescribeLogStreamsInput{
+		LogGroupName: &logGroup,
+		OrderBy:      types.OrderByLastEventTime,
+		Descending:   aws.Bool(true),
+		Limit:        aws.Int32(limit),
+		NextToken:    nextToken,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return out.LogStreams, out.NextToken, nil
 }
 
 func fetchLogStreams(ctx context.Context, client LogsClient, logGroup string, limit int) ([]types.LogStream, error) {
@@ -127,19 +158,13 @@ func fetchLogStreams(ctx context.Context, client LogsClient, logGroup string, li
 			pageLimit = int32(remaining)
 		}
 
-		out, err := client.DescribeLogStreams(ctx, &cloudwatchlogs.DescribeLogStreamsInput{
-			LogGroupName: &logGroup,
-			OrderBy:      types.OrderByLastEventTime,
-			Descending:   aws.Bool(true),
-			Limit:        aws.Int32(pageLimit),
-			NextToken:    nextToken,
-		})
+		streams, newToken, err := fetchLogStreamPage(ctx, client, logGroup, pageLimit, nextToken)
 		if err != nil {
 			return allStreams, err
 		}
-		allStreams = append(allStreams, out.LogStreams...)
-		nextToken = out.NextToken
-		if nextToken == nil || len(out.LogStreams) == 0 {
+		allStreams = append(allStreams, streams...)
+		nextToken = newToken
+		if nextToken == nil || len(streams) == 0 {
 			break
 		}
 	}
@@ -191,14 +216,14 @@ func selectInvocations(allInvocations []InvocationSummary, count, offset int) []
 
 func toRecord(inv InvocationSummary) InvocationRecord {
 	return InvocationRecord{
-		RequestID:  inv.RequestID,
-		Timestamp:  inv.StartTime.UTC().Format(time.RFC3339),
-		Duration:   inv.Duration,
-		BilledMs:   inv.BilledMs,
-		MemUsedMB:  inv.MemUsedMB,
-		MaxMemMB:   inv.MaxMemMB,
-		IsError:    inv.IsError,
-		ErrorLines: inv.ErrorLines,
-		LogLines:   inv.LogLines,
+		RequestID:       inv.RequestID,
+		Timestamp:       inv.StartTime.UTC().Format(time.RFC3339),
+		Duration:        inv.Duration,
+		BilledMs:        inv.BilledMs,
+		MemorySizeMB:    inv.MemorySizeMB,
+		MaxMemoryUsedMB: inv.MaxMemoryUsedMB,
+		IsError:         inv.IsError,
+		ErrorLines:      inv.ErrorLines,
+		LogLines:        inv.LogLines,
 	}
 }

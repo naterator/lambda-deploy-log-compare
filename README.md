@@ -32,7 +32,8 @@ go install github.com/naterator/lambda-deploy-log-compare@latest
 # Compare
 ./lambda-deploy-log-compare compare \
     --a ./snapshots/my_func_a_pre-deploy.json \
-    --b ./snapshots/my_func_a_post-deploy.json
+    --b ./snapshots/my_func_a_post-deploy.json \
+    --strict
 ```
 
 If `./snapshots` does not exist yet, the tool creates it before writing snapshot files.
@@ -70,17 +71,23 @@ If no log streams are found for a function, the command exits successfully for t
 Loads two snapshot files and prints a side-by-side comparison:
 
 ```
-lambda-deploy-log-compare compare --a <baseline.json> --b <new.json>
+lambda-deploy-log-compare compare --a <baseline.json> --b <new.json> [options]
 ```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--a` | | Path to baseline snapshot JSON file (required) |
+| `--b` | | Path to new snapshot JSON file (required) |
+| `--strict` | `false` | Fail if the two snapshots disagree on function name or log group |
 
 The comparison includes:
 
 - **Error count** — warns if errors increased
 - **Error patterns** — new patterns that appeared, old patterns that disappeared
-- **Duration stats** — min, avg, p50, p90, max (in milliseconds)
-- **Memory usage** — min, avg, max peak memory (in MB)
+- **Duration stats** — min, avg, p50, p90, max (in milliseconds), ignoring malformed values with an explicit ignored count
+- **Memory usage** — min, avg, max peak memory (in MB), ignoring malformed values with an explicit ignored count
 - **Log pattern diff** — new and gone log line patterns (UUIDs normalized)
-- **Snapshot mismatch warnings** — warns when the two files appear to be from different Lambda functions or log groups
+- **Snapshot mismatch warnings** — warns when the two files appear to be from different Lambda functions or log groups, or fails early with `--strict`
 
 ## Snapshot Format
 
@@ -89,8 +96,9 @@ Each snapshot file contains one `Snapshot` object with metadata plus an `invocat
 Important field notes:
 
 - `duration` and `billed_ms` come from Lambda `REPORT` lines.
-- `mem_used_mb` currently stores Lambda `Memory Size`, which is the configured memory size for the function.
-- `max_mem_mb` stores Lambda `Max Memory Used`, which is the value used for memory comparison stats and `peak_mem` in compare output.
+- `memory_size_mb` stores Lambda `Memory Size`, which is the configured memory size for the function.
+- `max_memory_used_mb` stores Lambda `Max Memory Used`, which is the value used for memory comparison stats and `peak_mem` in compare output.
+- Older snapshots that used `mem_used_mb` and `max_mem_mb` still load correctly.
 
 ## AWS Authentication
 
@@ -103,9 +111,9 @@ The IAM principal needs these permissions:
 
 ## How It Works
 
-1. **Stream discovery** — Fetches recent log streams ordered by last event time (most recent first), with some extra headroom beyond the requested `offset + count`.
-2. **Invocation parsing** — Reads events from each stream, tracks invocations from Lambda `START` and `REPORT` markers, and assigns non-marker log lines to the most recently seen request in that stream. Extracts duration, billed duration, memory size, and max memory used from `REPORT` lines. Each stream gets a 30-second timeout, and collection stops early once enough invocations are found.
-3. **Error detection** — Any log line containing `error`, `panic`, `fatal`, `traceback`, or `exception` (case-insensitive) flags the invocation as an error.
+1. **Stream discovery** — Fetches recent log streams ordered by last event time (most recent first) page by page until the requested `offset + count` is satisfied or the log group is exhausted.
+2. **Invocation parsing** — Reads events from each stream, tracks invocations from Lambda `START` and `REPORT` markers, and uses inline `RequestId` hints plus current stream context to associate log lines that land outside the normal `START -> logs -> REPORT` sequence. Extracts duration, billed duration, memory size, and max memory used from `REPORT` lines. Each stream gets a 30-second timeout, and collection stops early once enough invocations are found.
+3. **Error detection** — Flags explicit error-style log lines such as `error`, `panic`, `fatal`, `traceback`, `exception`, and Lambda runtime failure messages, while skipping common benign counter-style phrases like `error_count=0`.
 4. **Snapshot selection** — From all discovered invocations (sorted by time, most recent first), skips the first `offset` invocations, then takes the next `count`.
 5. **Pattern normalization** — For comparison, log lines are normalized by collapsing UUID-like hex strings (32+ chars) to `<UUID>` and truncating to 100 characters. This lets you compare structural patterns rather than exact values.
 
@@ -146,12 +154,12 @@ types.go      Shared data types (InvocationSummary, InvocationRecord, Snapshot)
   Error count unchanged
 
 === Duration Comparison ===
-  Baseline: min=45.2ms avg=120.5ms p50=98.3ms p90=210.1ms max=250.7ms (n=20)
-  New     : min=42.1ms avg=115.8ms p50=95.0ms p90=205.3ms max=245.2ms (n=20)
+  Baseline: min=45.2ms avg=120.5ms p50=98.3ms p90=210.1ms max=250.7ms (n=20, ignored=0 malformed)
+  New     : min=42.1ms avg=115.8ms p50=95.0ms p90=205.3ms max=245.2ms (n=20, ignored=0 malformed)
 
 === Memory Usage Comparison ===
-  Baseline: min=85MB avg=92MB max=105MB (n=20)
-  New     : min=84MB avg=91MB max=103MB (n=20)
+  Baseline: min=85MB avg=92MB max=105MB (n=20, ignored=0 malformed)
+  New     : min=84MB avg=91MB max=103MB (n=20, ignored=0 malformed)
 
 === Log Pattern Diff ===
   No significant log pattern differences detected

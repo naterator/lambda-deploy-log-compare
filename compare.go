@@ -5,12 +5,21 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 )
 
 const maxPatternDisplay = 20
 
 func runCompare(fileA, fileB string) error {
+	return runCompareWithOptions(fileA, fileB, CompareOptions{})
+}
+
+type CompareOptions struct {
+	Strict bool
+}
+
+func runCompareWithOptions(fileA, fileB string, opts CompareOptions) error {
 	snapA, err := loadSnapshot(fileA)
 	if err != nil {
 		return fmt.Errorf("load %s: %w", fileA, err)
@@ -20,35 +29,39 @@ func runCompare(fileA, fileB string) error {
 		return fmt.Errorf("load %s: %w", fileB, err)
 	}
 
-	fmt.Printf("=== Comparison: %s ===\n", snapA.FunctionName)
-	fmt.Printf("  Baseline: %s (label: %s, captured: %s)\n", fileA, snapA.Label, snapA.CapturedAt)
-	fmt.Printf("  New:      %s (label: %s, captured: %s)\n\n", fileB, snapB.Label, snapB.CapturedAt)
 	warnings := comparisonWarnings(snapA, snapB)
+	if opts.Strict && len(warnings) > 0 {
+		return fmt.Errorf("strict comparison failed: %s", strings.Join(warnings, "; "))
+	}
+
+	fmt.Fprintf(stdout, "=== Comparison: %s ===\n", snapA.FunctionName)
+	fmt.Fprintf(stdout, "  Baseline: %s (label: %s, captured: %s)\n", fileA, snapA.Label, snapA.CapturedAt)
+	fmt.Fprintf(stdout, "  New:      %s (label: %s, captured: %s)\n\n", fileB, snapB.Label, snapB.CapturedAt)
 	for _, warning := range warnings {
-		fmt.Printf("  WARNING: %s\n", warning)
+		fmt.Fprintf(stdout, "  WARNING: %s\n", warning)
 	}
 	if len(warnings) > 0 {
-		fmt.Println()
+		fmt.Fprintln(stdout)
 	}
 
 	printSnapshotSummary("BASELINE", snapA)
-	fmt.Println()
+	fmt.Fprintln(stdout)
 	printSnapshotSummary("NEW", snapB)
-	fmt.Println()
+	fmt.Fprintln(stdout)
 
 	// Error comparison
-	fmt.Println("=== Error Comparison ===")
+	fmt.Fprintln(stdout, "=== Error Comparison ===")
 	errorsA := countErrors(snapA)
 	errorsB := countErrors(snapB)
-	fmt.Printf("  Baseline errors: %d / %d invocations\n", errorsA, len(snapA.Invocations))
-	fmt.Printf("  New errors:      %d / %d invocations\n", errorsB, len(snapB.Invocations))
+	fmt.Fprintf(stdout, "  Baseline errors: %d / %d invocations\n", errorsA, len(snapA.Invocations))
+	fmt.Fprintf(stdout, "  New errors:      %d / %d invocations\n", errorsB, len(snapB.Invocations))
 
 	if errorsB > errorsA {
-		fmt.Println("  *** WARNING: Error count increased! ***")
+		fmt.Fprintln(stdout, "  *** WARNING: Error count increased! ***")
 	} else if errorsB < errorsA {
-		fmt.Println("  Error count decreased (good)")
+		fmt.Fprintln(stdout, "  Error count decreased (good)")
 	} else {
-		fmt.Println("  Error count unchanged")
+		fmt.Fprintln(stdout, "  Error count unchanged")
 	}
 
 	patternsA := errorPatterns(snapA)
@@ -56,31 +69,31 @@ func runCompare(fileA, fileB string) error {
 
 	newPatterns := diffPatterns(patternsA, patternsB)
 	if len(newPatterns) > 0 {
-		fmt.Println("\n  *** NEW error patterns in new deployment: ***")
+		fmt.Fprintln(stdout, "\n  *** NEW error patterns in new deployment: ***")
 		for _, p := range newPatterns {
-			fmt.Printf("    - %s\n", p)
+			fmt.Fprintf(stdout, "    - %s\n", p)
 		}
 	}
 	gonePatterns := diffPatterns(patternsB, patternsA)
 	if len(gonePatterns) > 0 {
-		fmt.Println("\n  Error patterns no longer appearing:")
+		fmt.Fprintln(stdout, "\n  Error patterns no longer appearing:")
 		for _, p := range gonePatterns {
-			fmt.Printf("    - %s\n", p)
+			fmt.Fprintf(stdout, "    - %s\n", p)
 		}
 	}
 
 	// Duration comparison
-	fmt.Println("\n=== Duration Comparison ===")
+	fmt.Fprintln(stdout, "\n=== Duration Comparison ===")
 	printDurationStats("Baseline", snapA)
 	printDurationStats("New     ", snapB)
 
 	// Memory comparison
-	fmt.Println("\n=== Memory Usage Comparison ===")
+	fmt.Fprintln(stdout, "\n=== Memory Usage Comparison ===")
 	printMemoryStats("Baseline", snapA)
 	printMemoryStats("New     ", snapB)
 
 	// Log pattern diff
-	fmt.Println("\n=== Log Pattern Diff ===")
+	fmt.Fprintln(stdout, "\n=== Log Pattern Diff ===")
 	logPatsA := logPatterns(snapA)
 	logPatsB := logPatterns(snapB)
 
@@ -88,29 +101,29 @@ func runCompare(fileA, fileB string) error {
 	goneLogPats := diffPatterns(logPatsB, logPatsA)
 
 	if len(newLogPats) > 0 {
-		fmt.Println("  New log patterns (only in new deployment):")
+		fmt.Fprintln(stdout, "  New log patterns (only in new deployment):")
 		limit := maxPatternDisplay
 		for i, p := range newLogPats {
 			if i >= limit {
-				fmt.Printf("    ... and %d more\n", len(newLogPats)-limit)
+				fmt.Fprintf(stdout, "    ... and %d more\n", len(newLogPats)-limit)
 				break
 			}
-			fmt.Printf("    + %s\n", truncate(p, 120))
+			fmt.Fprintf(stdout, "    + %s\n", truncate(p, 120))
 		}
 	}
 	if len(goneLogPats) > 0 {
-		fmt.Println("  Gone log patterns (only in baseline):")
+		fmt.Fprintln(stdout, "  Gone log patterns (only in baseline):")
 		limit := maxPatternDisplay
 		for i, p := range goneLogPats {
 			if i >= limit {
-				fmt.Printf("    ... and %d more\n", len(goneLogPats)-limit)
+				fmt.Fprintf(stdout, "    ... and %d more\n", len(goneLogPats)-limit)
 				break
 			}
-			fmt.Printf("    - %s\n", truncate(p, 120))
+			fmt.Fprintf(stdout, "    - %s\n", truncate(p, 120))
 		}
 	}
 	if len(newLogPats) == 0 && len(goneLogPats) == 0 {
-		fmt.Println("  No significant log pattern differences detected")
+		fmt.Fprintln(stdout, "  No significant log pattern differences detected")
 	}
 
 	return nil
@@ -127,17 +140,17 @@ func loadSnapshot(path string) (Snapshot, error) {
 }
 
 func printSnapshotSummary(label string, snap Snapshot) {
-	fmt.Printf("--- %s: %s [%s] (log group: %s) ---\n", label, snap.FunctionName, snap.Label, snap.LogGroup)
-	fmt.Printf("  Invocations captured: %d\n", len(snap.Invocations))
-	fmt.Printf("  Errors: %d\n", countErrors(snap))
+	fmt.Fprintf(stdout, "--- %s: %s [%s] (log group: %s) ---\n", label, snap.FunctionName, snap.Label, snap.LogGroup)
+	fmt.Fprintf(stdout, "  Invocations captured: %d\n", len(snap.Invocations))
+	fmt.Fprintf(stdout, "  Errors: %d\n", countErrors(snap))
 
 	if len(snap.Invocations) > 0 {
-		fmt.Println("  Recent invocations:")
+		fmt.Fprintln(stdout, "  Recent invocations:")
 		for i, inv := range snap.Invocations {
 			if i >= 5 {
 				break
 			}
-			fmt.Println(formatInvocationSummary(inv))
+			fmt.Fprintln(stdout, formatInvocationSummary(inv))
 		}
 	}
 }
@@ -192,33 +205,50 @@ func diffPatterns(baseline, other map[string]bool) []string {
 	return diff
 }
 
-func parseDurationMs(dur string) float64 {
-	dur = strings.TrimSpace(dur)
-	dur = strings.TrimSuffix(dur, " ms")
-	dur = strings.TrimSuffix(dur, "ms")
-	var ms float64
-	fmt.Sscanf(dur, "%f", &ms)
-	return ms
+func parseDurationMs(dur string) (float64, bool) {
+	return parseNumberWithSuffixes(dur, " ms", "ms")
 }
 
-func parseMemMB(mem string) float64 {
-	mem = strings.TrimSpace(mem)
-	mem = strings.TrimSuffix(mem, " MB")
-	mem = strings.TrimSuffix(mem, "MB")
-	var mb float64
-	fmt.Sscanf(mem, "%f", &mb)
-	return mb
+func parseMemMB(mem string) (float64, bool) {
+	return parseNumberWithSuffixes(mem, " MB", "MB")
+}
+
+func parseNumberWithSuffixes(value string, suffixes ...string) (float64, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, false
+	}
+	for _, suffix := range suffixes {
+		trimmed = strings.TrimSuffix(trimmed, suffix)
+	}
+	trimmed = strings.TrimSpace(trimmed)
+	number, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil {
+		return 0, false
+	}
+	return number, true
 }
 
 func printDurationStats(label string, snap Snapshot) {
 	var durations []float64
+	ignored := 0
 	for _, inv := range snap.Invocations {
-		if inv.Duration != "" {
-			durations = append(durations, parseDurationMs(inv.Duration))
+		if inv.Duration == "" {
+			continue
 		}
+		duration, ok := parseDurationMs(inv.Duration)
+		if !ok {
+			ignored++
+			continue
+		}
+		durations = append(durations, duration)
 	}
 	if len(durations) == 0 {
-		fmt.Printf("  %s: no duration data\n", label)
+		if ignored > 0 {
+			fmt.Fprintf(stdout, "  %s: no duration data (ignored=%d malformed)\n", label, ignored)
+			return
+		}
+		fmt.Fprintf(stdout, "  %s: no duration data\n", label)
 		return
 	}
 	sort.Float64s(durations)
@@ -233,19 +263,30 @@ func printDurationStats(label string, snap Snapshot) {
 		p90idx = len(durations) - 1
 	}
 
-	fmt.Printf("  %s: min=%.1fms avg=%.1fms p50=%.1fms p90=%.1fms max=%.1fms (n=%d)\n",
-		label, durations[0], avg, p50, durations[p90idx], durations[len(durations)-1], len(durations))
+	fmt.Fprintf(stdout, "  %s: min=%.1fms avg=%.1fms p50=%.1fms p90=%.1fms max=%.1fms (n=%d, ignored=%d malformed)\n",
+		label, durations[0], avg, p50, durations[p90idx], durations[len(durations)-1], len(durations), ignored)
 }
 
 func printMemoryStats(label string, snap Snapshot) {
 	var mems []float64
+	ignored := 0
 	for _, inv := range snap.Invocations {
-		if inv.MaxMemMB != "" {
-			mems = append(mems, parseMemMB(inv.MaxMemMB))
+		if inv.MaxMemoryUsedMB == "" {
+			continue
 		}
+		mem, ok := parseMemMB(inv.MaxMemoryUsedMB)
+		if !ok {
+			ignored++
+			continue
+		}
+		mems = append(mems, mem)
 	}
 	if len(mems) == 0 {
-		fmt.Printf("  %s: no memory data\n", label)
+		if ignored > 0 {
+			fmt.Fprintf(stdout, "  %s: no memory data (ignored=%d malformed)\n", label, ignored)
+			return
+		}
+		fmt.Fprintf(stdout, "  %s: no memory data\n", label)
 		return
 	}
 	sort.Float64s(mems)
@@ -253,8 +294,8 @@ func printMemoryStats(label string, snap Snapshot) {
 	for _, m := range mems {
 		sum += m
 	}
-	fmt.Printf("  %s: min=%.0fMB avg=%.0fMB max=%.0fMB (n=%d)\n",
-		label, mems[0], sum/float64(len(mems)), mems[len(mems)-1], len(mems))
+	fmt.Fprintf(stdout, "  %s: min=%.0fMB avg=%.0fMB max=%.0fMB (n=%d, ignored=%d malformed)\n",
+		label, mems[0], sum/float64(len(mems)), mems[len(mems)-1], len(mems), ignored)
 }
 
 func truncate(s string, maxLen int) string {
@@ -269,11 +310,11 @@ func formatInvocationSummary(inv InvocationRecord) string {
 		inv.Timestamp,
 		fmt.Sprintf("dur=%s", inv.Duration),
 	}
-	if inv.MaxMemMB != "" {
-		parts = append(parts, fmt.Sprintf("peak_mem=%s", inv.MaxMemMB))
+	if inv.MaxMemoryUsedMB != "" {
+		parts = append(parts, fmt.Sprintf("peak_mem=%s", inv.MaxMemoryUsedMB))
 	}
-	if inv.MemUsedMB != "" {
-		parts = append(parts, fmt.Sprintf("mem_size=%s", inv.MemUsedMB))
+	if inv.MemorySizeMB != "" {
+		parts = append(parts, fmt.Sprintf("mem_size=%s", inv.MemorySizeMB))
 	}
 
 	line := "    " + strings.Join(parts, "  ")

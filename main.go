@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -11,8 +12,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 )
 
+var (
+	stdout            io.Writer                                = os.Stdout
+	stderr            io.Writer                                = os.Stderr
+	logsClientFactory func(string, string) (LogsClient, error) = newLogsClient
+)
+
 func main() {
+	os.Exit(run(os.Args[1:]))
+}
+
+func run(args []string) int {
 	captureCmd := flag.NewFlagSet("capture", flag.ContinueOnError)
+	captureCmd.SetOutput(stderr)
 	captureCmd.Usage = func() { printUsage() }
 	captureFunc := captureCmd.String("function", "", "Lambda function name(s), comma-separated")
 	captureCount := captureCmd.Int("count", 20, "Number of invocations to capture")
@@ -23,31 +35,33 @@ func main() {
 	captureProfile := captureCmd.String("profile", "", "AWS CLI profile (optional)")
 
 	compareCmd := flag.NewFlagSet("compare", flag.ContinueOnError)
+	compareCmd.SetOutput(stderr)
 	compareCmd.Usage = func() { printUsage() }
 	compareFileA := compareCmd.String("a", "", "Path to first snapshot file (baseline)")
 	compareFileB := compareCmd.String("b", "", "Path to second snapshot file (new deployment)")
+	compareStrict := compareCmd.Bool("strict", false, "Fail if the snapshot function names or log groups differ")
 
-	if len(os.Args) < 2 {
+	if len(args) < 1 {
 		printUsage()
-		os.Exit(1)
+		return 1
 	}
 
-	switch os.Args[1] {
+	switch args[0] {
 	case "capture":
-		if err := captureCmd.Parse(os.Args[2:]); err != nil {
-			os.Exit(1)
+		if err := captureCmd.Parse(args[1:]); err != nil {
+			return 1
 		}
 		functions := parseFunctionNames(*captureFunc)
 		if err := validateCaptureInputs(functions, *captureLabel, *captureCount, *captureOffset); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			fmt.Fprintf(stderr, "Error: %v\n", err)
 			printUsage()
-			os.Exit(1)
+			return 1
 		}
 
-		client, err := newLogsClient(*captureRegion, *captureProfile)
+		client, err := logsClientFactory(*captureRegion, *captureProfile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error initializing AWS client: %v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(stderr, "Error initializing AWS client: %v\n", err)
+			return 1
 		}
 
 		var captureErrors int
@@ -55,41 +69,43 @@ func main() {
 			logGroup := logGroupForFunction(fn)
 			err := runCapture(client, fn, logGroup, *captureCount, *captureOffset, *captureLabel, *captureOutDir)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error capturing %s: %v\n", fn, err)
+				fmt.Fprintf(stderr, "Error capturing %s: %v\n", fn, err)
 				captureErrors++
 			}
 		}
 		if captureErrors > 0 {
-			fmt.Fprintf(os.Stderr, "%d capture(s) failed\n", captureErrors)
-			os.Exit(1)
+			fmt.Fprintf(stderr, "%d capture(s) failed\n", captureErrors)
+			return 1
 		}
+		return 0
 
 	case "compare":
-		if err := compareCmd.Parse(os.Args[2:]); err != nil {
-			os.Exit(1)
+		if err := compareCmd.Parse(args[1:]); err != nil {
+			return 1
 		}
 		if *compareFileA == "" || *compareFileB == "" {
-			fmt.Fprintln(os.Stderr, "Error: --a and --b are required")
+			fmt.Fprintln(stderr, "Error: --a and --b are required")
 			printUsage()
-			os.Exit(1)
+			return 1
 		}
-		if err := runCompare(*compareFileA, *compareFileB); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+		if err := runCompareWithOptions(*compareFileA, *compareFileB, CompareOptions{Strict: *compareStrict}); err != nil {
+			fmt.Fprintf(stderr, "Error: %v\n", err)
+			return 1
 		}
+		return 0
 
 	default:
 		printUsage()
-		os.Exit(1)
+		return 1
 	}
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `lambda-deploy-log-compare - Compare Lambda invocation logs across deployments
+	fmt.Fprintf(stderr, `lambda-deploy-log-compare - Compare Lambda invocation logs across deployments
 
 Usage:
   lambda-deploy-log-compare capture --function <name>[,<name>,...] --label <label> [options]
-  lambda-deploy-log-compare compare --a <baseline.json> --b <new.json>
+  lambda-deploy-log-compare compare --a <baseline.json> --b <new.json> [options]
 
 Commands:
   capture   Capture the most recent invocation logs for one or more Lambda functions
@@ -107,6 +123,7 @@ Capture options:
 Compare options:
   --a          Path to baseline snapshot JSON file (required)
   --b          Path to new deployment snapshot JSON file (required)
+  --strict     Fail if snapshot function names or log groups differ
 
 Log groups are derived as /aws/lambda/<function-name>.
 
@@ -152,7 +169,7 @@ func validateCaptureInputs(functions []string, label string, count, offset int) 
 	}
 }
 
-func newLogsClient(region, profile string) (*cloudwatchlogs.Client, error) {
+func newLogsClient(region, profile string) (LogsClient, error) {
 	var opts []func(*config.LoadOptions) error
 	opts = append(opts, config.WithRegion(region))
 	if profile != "" {
