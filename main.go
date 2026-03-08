@@ -37,13 +37,9 @@ func main() {
 		if err := captureCmd.Parse(os.Args[2:]); err != nil {
 			os.Exit(1)
 		}
-		if *captureLabel == "" {
-			fmt.Fprintln(os.Stderr, "Error: --label is required")
-			printUsage()
-			os.Exit(1)
-		}
-		if *captureFunc == "" {
-			fmt.Fprintln(os.Stderr, "Error: --function is required")
+		functions := parseFunctionNames(*captureFunc)
+		if err := validateCaptureInputs(functions, *captureLabel, *captureCount, *captureOffset); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			printUsage()
 			os.Exit(1)
 		}
@@ -55,11 +51,7 @@ func main() {
 		}
 
 		var captureErrors int
-		for _, fn := range strings.Split(*captureFunc, ",") {
-			fn = strings.TrimSpace(fn)
-			if fn == "" {
-				continue
-			}
+		for _, fn := range functions {
 			logGroup := logGroupForFunction(fn)
 			err := runCapture(client, fn, logGroup, *captureCount, *captureOffset, *captureLabel, *captureOutDir)
 			if err != nil {
@@ -106,8 +98,8 @@ Commands:
 Capture options:
   --function   Lambda function name(s), comma-separated (required)
   --label      Label for this snapshot, e.g. "pre-deploy" (required)
-  --count      Number of invocations to capture (default: 20)
-  --offset     Skip this many recent invocations before capturing (default: 0)
+  --count      Number of invocations to capture; must be > 0 (default: 20)
+  --offset     Skip this many recent invocations before capturing; must be >= 0 (default: 0)
   --out        Output directory for snapshot files (default: current dir)
   --region     AWS region (default: us-west-2)
   --profile    AWS CLI profile name (optional)
@@ -132,6 +124,32 @@ Typical workflow:
          --a ./snapshots/my_func_a_pre-deploy.json \
          --b ./snapshots/my_func_a_post-deploy.json
 `)
+}
+
+func parseFunctionNames(raw string) []string {
+	var names []string
+	for _, fn := range strings.Split(raw, ",") {
+		fn = strings.TrimSpace(fn)
+		if fn != "" {
+			names = append(names, fn)
+		}
+	}
+	return names
+}
+
+func validateCaptureInputs(functions []string, label string, count, offset int) error {
+	switch {
+	case label == "":
+		return fmt.Errorf("--label is required")
+	case len(functions) == 0:
+		return fmt.Errorf("--function is required")
+	case count <= 0:
+		return fmt.Errorf("--count must be greater than 0")
+	case offset < 0:
+		return fmt.Errorf("--offset must be greater than or equal to 0")
+	default:
+		return nil
+	}
 }
 
 func newLogsClient(region, profile string) (*cloudwatchlogs.Client, error) {

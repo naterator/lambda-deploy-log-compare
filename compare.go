@@ -23,6 +23,13 @@ func runCompare(fileA, fileB string) error {
 	fmt.Printf("=== Comparison: %s ===\n", snapA.FunctionName)
 	fmt.Printf("  Baseline: %s (label: %s, captured: %s)\n", fileA, snapA.Label, snapA.CapturedAt)
 	fmt.Printf("  New:      %s (label: %s, captured: %s)\n\n", fileB, snapB.Label, snapB.CapturedAt)
+	warnings := comparisonWarnings(snapA, snapB)
+	for _, warning := range warnings {
+		fmt.Printf("  WARNING: %s\n", warning)
+	}
+	if len(warnings) > 0 {
+		fmt.Println()
+	}
 
 	printSnapshotSummary("BASELINE", snapA)
 	fmt.Println()
@@ -126,17 +133,24 @@ func printSnapshotSummary(label string, snap Snapshot) {
 
 	if len(snap.Invocations) > 0 {
 		fmt.Println("  Recent invocations:")
-		shown := 0
-		for i := len(snap.Invocations) - 1; i >= 0 && shown < 5; i-- {
-			inv := snap.Invocations[i]
-			errMark := ""
-			if inv.IsError {
-				errMark = " [ERROR]"
+		for i, inv := range snap.Invocations {
+			if i >= 5 {
+				break
 			}
-			fmt.Printf("    %s  dur=%s  mem=%s%s\n", inv.Timestamp, inv.Duration, inv.MemUsedMB, errMark)
-			shown++
+			fmt.Println(formatInvocationSummary(inv))
 		}
 	}
+}
+
+func comparisonWarnings(snapA, snapB Snapshot) []string {
+	var warnings []string
+	if snapA.FunctionName != "" && snapB.FunctionName != "" && snapA.FunctionName != snapB.FunctionName {
+		warnings = append(warnings, fmt.Sprintf("snapshot function names differ (%s vs %s)", snapA.FunctionName, snapB.FunctionName))
+	}
+	if snapA.LogGroup != "" && snapB.LogGroup != "" && snapA.LogGroup != snapB.LogGroup {
+		warnings = append(warnings, fmt.Sprintf("snapshot log groups differ (%s vs %s)", snapA.LogGroup, snapB.LogGroup))
+	}
+	return warnings
 }
 
 func countErrors(snap Snapshot) int {
@@ -248,4 +262,23 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+func formatInvocationSummary(inv InvocationRecord) string {
+	parts := []string{
+		inv.Timestamp,
+		fmt.Sprintf("dur=%s", inv.Duration),
+	}
+	if inv.MaxMemMB != "" {
+		parts = append(parts, fmt.Sprintf("peak_mem=%s", inv.MaxMemMB))
+	}
+	if inv.MemUsedMB != "" {
+		parts = append(parts, fmt.Sprintf("mem_size=%s", inv.MemUsedMB))
+	}
+
+	line := "    " + strings.Join(parts, "  ")
+	if inv.IsError {
+		line += " [ERROR]"
+	}
+	return line
 }

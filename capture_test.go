@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -302,5 +303,129 @@ func TestRunCapture_NoStreams(t *testing.T) {
 	outPath := filepath.Join(outDir, "empty-func_test.json")
 	if _, err := os.Stat(outPath); !os.IsNotExist(err) {
 		t.Error("expected no output file when no streams found")
+	}
+}
+
+func TestRunCapture_CreatesOutputDirectory(t *testing.T) {
+	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+
+	mock := &mockLogsClient{
+		describeLogStreamsFn: func(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
+			return &cloudwatchlogs.DescribeLogStreamsOutput{
+				LogStreams: []types.LogStream{{LogStreamName: aws.String("stream-1")}},
+			}, nil
+		},
+		getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+			return &cloudwatchlogs.GetLogEventsOutput{
+				Events: []types.OutputLogEvent{
+					{Message: aws.String("START RequestId: req-1 Version: $LATEST"), Timestamp: aws.Int64(ts)},
+					{Message: aws.String("REPORT RequestId: req-1\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(ts + 100)},
+				},
+				NextForwardToken: aws.String("done"),
+			}, nil
+		},
+	}
+
+	outDir := filepath.Join(t.TempDir(), "nested", "snapshots")
+	if err := runCapture(mock, "test-func", "/aws/lambda/test-func", 1, 0, "test-label", outDir); err != nil {
+		t.Fatalf("runCapture error: %v", err)
+	}
+
+	outPath := filepath.Join(outDir, "test-func_test-label.json")
+	if _, err := os.Stat(outPath); err != nil {
+		t.Fatalf("expected output file to exist: %v", err)
+	}
+}
+
+func TestRunCapture_SelectsMostRecentInvocationsAfterOffset(t *testing.T) {
+	base := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+	streamEvents := map[string][]types.OutputLogEvent{
+		"stream-1": {
+			{Message: aws.String("START RequestId: req-1 Version: $LATEST"), Timestamp: aws.Int64(base + 1000)},
+			{Message: aws.String("REPORT RequestId: req-1\tDuration: 10 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 40 MB"), Timestamp: aws.Int64(base + 1100)},
+		},
+		"stream-2": {
+			{Message: aws.String("START RequestId: req-2 Version: $LATEST"), Timestamp: aws.Int64(base + 2000)},
+			{Message: aws.String("REPORT RequestId: req-2\tDuration: 20 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 50 MB"), Timestamp: aws.Int64(base + 2100)},
+		},
+		"stream-3": {
+			{Message: aws.String("START RequestId: req-3 Version: $LATEST"), Timestamp: aws.Int64(base + 3000)},
+			{Message: aws.String("REPORT RequestId: req-3\tDuration: 30 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 60 MB"), Timestamp: aws.Int64(base + 3100)},
+		},
+	}
+
+	mock := &mockLogsClient{
+		describeLogStreamsFn: func(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
+			return &cloudwatchlogs.DescribeLogStreamsOutput{
+				LogStreams: []types.LogStream{
+					{LogStreamName: aws.String("stream-1")},
+					{LogStreamName: aws.String("stream-2")},
+					{LogStreamName: aws.String("stream-3")},
+				},
+			}, nil
+		},
+		getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+			return &cloudwatchlogs.GetLogEventsOutput{
+				Events:           streamEvents[*params.LogStreamName],
+				NextForwardToken: aws.String("done"),
+			}, nil
+		},
+	}
+
+	outDir := t.TempDir()
+	if err := runCapture(mock, "test-func", "/aws/lambda/test-func", 2, 1, "offset", outDir); err != nil {
+		t.Fatalf("runCapture error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "test-func_offset.json"))
+	if err != nil {
+		t.Fatalf("failed to read output file: %v", err)
+	}
+
+	var snap Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatalf("failed to unmarshal snapshot: %v", err)
+	}
+	if len(snap.Invocations) != 2 {
+		t.Fatalf("expected 2 invocations, got %d", len(snap.Invocations))
+	}
+
+	got := []string{snap.Invocations[0].RequestID, snap.Invocations[1].RequestID}
+	want := []string{"req-2", "req-1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("request IDs = %v, want %v", got, want)
+	}
+}
+
+func TestRunCapture_InvalidArguments(t *testing.T) {
+	tests := []struct {
+		name   string
+		count  int
+		offset int
+		want   string
+	}{
+		{
+			name:  "non-positive count",
+			count: 0,
+			want:  "count must be greater than 0",
+		},
+		{
+			name:   "negative offset",
+			count:  1,
+			offset: -1,
+			want:   "offset must be greater than or equal to 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := runCapture(&mockLogsClient{}, "test-func", "/aws/lambda/test-func", tt.count, tt.offset, "label", t.TempDir())
+			if err == nil {
+				t.Fatalf("runCapture returned nil, want %q", tt.want)
+			}
+			if err.Error() != tt.want {
+				t.Fatalf("runCapture error = %q, want %q", err.Error(), tt.want)
+			}
+		})
 	}
 }

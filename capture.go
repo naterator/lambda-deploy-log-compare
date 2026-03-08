@@ -24,6 +24,13 @@ func logGroupForFunction(name string) string {
 }
 
 func runCapture(client LogsClient, funcName, logGroup string, count, offset int, label, outDir string) error {
+	if count <= 0 {
+		return fmt.Errorf("count must be greater than 0")
+	}
+	if offset < 0 {
+		return fmt.Errorf("offset must be greater than or equal to 0")
+	}
+
 	ctx := context.Background()
 	needed := offset + count
 
@@ -70,28 +77,15 @@ func runCapture(client LogsClient, funcName, logGroup string, count, offset int,
 		}
 	}
 
-	// Sort by start time descending (most recent first)
-	sort.Slice(allInvocations, func(i, j int) bool {
-		return allInvocations[i].StartTime.After(allInvocations[j].StartTime)
-	})
-
-	// Apply offset: skip the most recent `offset` invocations, then take `count`
-	if offset > 0 {
-		if offset >= len(allInvocations) {
-			fmt.Printf("  Warning: only found %d invocations, but offset is %d — no invocations to capture\n", len(allInvocations), offset)
-			allInvocations = nil
-		} else {
-			allInvocations = allInvocations[offset:]
-		}
-	}
-	if len(allInvocations) > count {
-		allInvocations = allInvocations[:count]
+	selectedInvocations := selectInvocations(allInvocations, count, offset)
+	if offset > 0 && len(selectedInvocations) == 0 {
+		fmt.Printf("  Warning: only found %d invocations, but offset is %d — no invocations to capture\n", len(allInvocations), offset)
 	}
 
-	fmt.Printf("  Selected %d invocations\n", len(allInvocations))
+	fmt.Printf("  Selected %d invocations\n", len(selectedInvocations))
 
 	var records []InvocationRecord
-	for _, inv := range allInvocations {
+	for _, inv := range selectedInvocations {
 		records = append(records, toRecord(inv))
 	}
 
@@ -107,6 +101,9 @@ func runCapture(client LogsClient, funcName, logGroup string, count, offset int,
 	data, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return fmt.Errorf("create output directory: %w", err)
 	}
 	if err := os.WriteFile(outPath, data, 0644); err != nil {
 		return fmt.Errorf("write snapshot: %w", err)
@@ -173,6 +170,23 @@ func fetchLogEvents(ctx context.Context, client LogsClient, logGroup, streamName
 		nextToken = out.NextForwardToken
 	}
 	return allEvents, nil
+}
+
+func selectInvocations(allInvocations []InvocationSummary, count, offset int) []InvocationSummary {
+	sort.Slice(allInvocations, func(i, j int) bool {
+		return allInvocations[i].StartTime.After(allInvocations[j].StartTime)
+	})
+
+	if offset > 0 {
+		if offset >= len(allInvocations) {
+			return nil
+		}
+		allInvocations = allInvocations[offset:]
+	}
+	if len(allInvocations) > count {
+		allInvocations = allInvocations[:count]
+	}
+	return allInvocations
 }
 
 func toRecord(inv InvocationSummary) InvocationRecord {

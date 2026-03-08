@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -182,13 +184,13 @@ func TestRunCompare(t *testing.T) {
 		Label:        "new",
 		Invocations: []InvocationRecord{
 			{
-				RequestID: "req-2",
-				Timestamp: "2026-02-25T12:00:00Z",
-				Duration:  "120 ms",
-				MaxMemMB:  "90 MB",
-				IsError:   true,
+				RequestID:  "req-2",
+				Timestamp:  "2026-02-25T12:00:00Z",
+				Duration:   "120 ms",
+				MaxMemMB:   "90 MB",
+				IsError:    true,
 				ErrorLines: []string{"connection error"},
-				LogLines:  []string{"starting", "connection error"},
+				LogLines:   []string{"starting", "connection error"},
 			},
 		},
 	}
@@ -222,6 +224,121 @@ func TestRunCompare_FileNotFound(t *testing.T) {
 	}
 }
 
+func TestComparisonWarnings(t *testing.T) {
+	t.Run("no mismatch", func(t *testing.T) {
+		got := comparisonWarnings(
+			Snapshot{FunctionName: "func-a", LogGroup: "/aws/lambda/func-a"},
+			Snapshot{FunctionName: "func-a", LogGroup: "/aws/lambda/func-a"},
+		)
+		if len(got) != 0 {
+			t.Fatalf("comparisonWarnings returned %v, want no warnings", got)
+		}
+	})
+
+	t.Run("function and log group mismatch", func(t *testing.T) {
+		got := comparisonWarnings(
+			Snapshot{FunctionName: "func-a", LogGroup: "/aws/lambda/func-a"},
+			Snapshot{FunctionName: "func-b", LogGroup: "/aws/lambda/func-b"},
+		)
+		if len(got) != 2 {
+			t.Fatalf("comparisonWarnings returned %v, want 2 warnings", got)
+		}
+		if got[0] != "snapshot function names differ (func-a vs func-b)" {
+			t.Fatalf("first warning = %q", got[0])
+		}
+		if got[1] != "snapshot log groups differ (/aws/lambda/func-a vs /aws/lambda/func-b)" {
+			t.Fatalf("second warning = %q", got[1])
+		}
+	})
+}
+
+func TestFormatInvocationSummary(t *testing.T) {
+	inv := InvocationRecord{
+		Timestamp: "2026-02-25T12:00:00Z",
+		Duration:  "120 ms",
+		MaxMemMB:  "90 MB",
+		MemUsedMB: "128 MB",
+		IsError:   true,
+	}
+
+	got := formatInvocationSummary(inv)
+	want := "    2026-02-25T12:00:00Z  dur=120 ms  peak_mem=90 MB  mem_size=128 MB [ERROR]"
+	if got != want {
+		t.Fatalf("formatInvocationSummary() = %q, want %q", got, want)
+	}
+}
+
+func TestPrintSnapshotSummary_ShowsMostRecentInvocationsFirst(t *testing.T) {
+	snap := Snapshot{
+		FunctionName: "test-func",
+		LogGroup:     "/aws/lambda/test-func",
+		Label:        "baseline",
+		Invocations: []InvocationRecord{
+			{Timestamp: "2026-02-25T10:06:00Z", Duration: "60 ms", MaxMemMB: "96 MB", MemUsedMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:05:00Z", Duration: "50 ms", MaxMemMB: "95 MB", MemUsedMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:04:00Z", Duration: "40 ms", MaxMemMB: "94 MB", MemUsedMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:03:00Z", Duration: "30 ms", MaxMemMB: "93 MB", MemUsedMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:02:00Z", Duration: "20 ms", MaxMemMB: "92 MB", MemUsedMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:01:00Z", Duration: "10 ms", MaxMemMB: "91 MB", MemUsedMB: "128 MB"},
+		},
+	}
+
+	output := captureStdout(t, func() {
+		printSnapshotSummary("BASELINE", snap)
+	})
+
+	if !strings.Contains(output, "2026-02-25T10:06:00Z") {
+		t.Fatalf("output did not include newest invocation: %s", output)
+	}
+	if strings.Contains(output, "2026-02-25T10:01:00Z") {
+		t.Fatalf("output included the sixth-oldest invocation: %s", output)
+	}
+}
+
+func TestRunCompare_WarnsOnMismatchedSnapshots(t *testing.T) {
+	snapA := Snapshot{
+		FunctionName: "func-a",
+		LogGroup:     "/aws/lambda/func-a",
+		CapturedAt:   "2026-02-25T10:00:00Z",
+		Label:        "baseline",
+	}
+	snapB := Snapshot{
+		FunctionName: "func-b",
+		LogGroup:     "/aws/lambda/func-b",
+		CapturedAt:   "2026-02-25T12:00:00Z",
+		Label:        "new",
+	}
+
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "a.json")
+	fileB := filepath.Join(dir, "b.json")
+	for _, pair := range []struct {
+		path string
+		snap Snapshot
+	}{{fileA, snapA}, {fileB, snapB}} {
+		data, err := json.MarshalIndent(pair.snap, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(pair.path, data, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	output := captureStdout(t, func() {
+		if err := runCompare(fileA, fileB); err != nil {
+			t.Fatalf("runCompare error: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "WARNING: snapshot function names differ (func-a vs func-b)") {
+		t.Fatalf("output missing function-name warning: %s", output)
+	}
+	if !strings.Contains(output, "WARNING: snapshot log groups differ (/aws/lambda/func-a vs /aws/lambda/func-b)") {
+		t.Fatalf("output missing log-group warning: %s", output)
+	}
+}
+
 func TestParseDurationMs(t *testing.T) {
 	tests := []struct {
 		input string
@@ -240,6 +357,35 @@ func TestParseDurationMs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe error: %v", err)
+	}
+	os.Stdout = w
+
+	defer func() {
+		os.Stdout = oldStdout
+	}()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("stdout writer close error: %v", err)
+	}
+	output, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("stdout read error: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("stdout reader close error: %v", err)
+	}
+	return string(output)
 }
 
 func TestParseMemMB(t *testing.T) {

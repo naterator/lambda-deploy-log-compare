@@ -1,4 +1,4 @@
-module lambda-deploy-log-compare
+module github.com/naterator/lambda-deploy-log-compare
 
 go 1.25.0
 

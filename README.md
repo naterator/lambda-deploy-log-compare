@@ -35,6 +35,8 @@ go install github.com/naterator/lambda-deploy-log-compare@latest
     --b ./snapshots/my_func_a_post-deploy.json
 ```
 
+If `./snapshots` does not exist yet, the tool creates it before writing snapshot files.
+
 ## Commands
 
 ### `capture`
@@ -49,17 +51,19 @@ lambda-deploy-log-compare capture --function <name>[,<name>,...] --label <label>
 |---|---|---|
 | `--function` | | Lambda function name(s), comma-separated (required) |
 | `--label` | | Label for the snapshot, e.g. `pre-deploy` (required) |
-| `--count` | `20` | Number of invocations to capture |
-| `--offset` | `0` | Skip this many recent invocations before capturing |
+| `--count` | `20` | Number of invocations to capture. Must be greater than `0`. |
+| `--offset` | `0` | Skip this many recent invocations before capturing. Must be `0` or greater. |
 | `--out` | `.` | Output directory for snapshot JSON files |
 | `--region` | `us-west-2` | AWS region |
 | `--profile` | | AWS CLI profile name |
 
 Log groups are derived as `/aws/lambda/<function-name>`.
 
-Output files are named `<function-name>_<label>.json` in the output directory. Each function gets its own snapshot file.
+Output files are named `<function-name>_<label>.json` in the output directory. Each function gets its own snapshot file, and the output directory is created automatically when a snapshot is written.
 
 The `--offset` flag lets you look further back in time. For example, `--offset 100 --count 20` skips the 100 most recent invocations and captures the 20 after that. This is useful for grabbing a historical baseline to compare against.
+
+If no log streams are found for a function, the command exits successfully for that function and does not write a snapshot file.
 
 ### `compare`
 
@@ -76,6 +80,17 @@ The comparison includes:
 - **Duration stats** — min, avg, p50, p90, max (in milliseconds)
 - **Memory usage** — min, avg, max peak memory (in MB)
 - **Log pattern diff** — new and gone log line patterns (UUIDs normalized)
+- **Snapshot mismatch warnings** — warns when the two files appear to be from different Lambda functions or log groups
+
+## Snapshot Format
+
+Each snapshot file contains one `Snapshot` object with metadata plus an `invocations` array.
+
+Important field notes:
+
+- `duration` and `billed_ms` come from Lambda `REPORT` lines.
+- `mem_used_mb` currently stores Lambda `Memory Size`, which is the configured memory size for the function.
+- `max_mem_mb` stores Lambda `Max Memory Used`, which is the value used for memory comparison stats and `peak_mem` in compare output.
 
 ## AWS Authentication
 
@@ -88,8 +103,8 @@ The IAM principal needs these permissions:
 
 ## How It Works
 
-1. **Stream discovery** — Fetches log streams ordered by last event time (most recent first), with headroom beyond the requested offset + count.
-2. **Invocation parsing** — Reads events from each stream and groups them by request ID using Lambda's `START`/`END`/`REPORT` markers. Extracts duration, billed duration, memory size, and max memory used from `REPORT` lines. Each stream gets a 30-second timeout, and collection stops early once enough invocations are found.
+1. **Stream discovery** — Fetches recent log streams ordered by last event time (most recent first), with some extra headroom beyond the requested `offset + count`.
+2. **Invocation parsing** — Reads events from each stream, tracks invocations from Lambda `START` and `REPORT` markers, and assigns non-marker log lines to the most recently seen request in that stream. Extracts duration, billed duration, memory size, and max memory used from `REPORT` lines. Each stream gets a 30-second timeout, and collection stops early once enough invocations are found.
 3. **Error detection** — Any log line containing `error`, `panic`, `fatal`, `traceback`, or `exception` (case-insensitive) flags the invocation as an error.
 4. **Snapshot selection** — From all discovered invocations (sorted by time, most recent first), skips the first `offset` invocations, then takes the next `count`.
 5. **Pattern normalization** — For comparison, log lines are normalized by collapsing UUID-like hex strings (32+ chars) to `<UUID>` and truncating to 100 characters. This lets you compare structural patterns rather than exact values.
@@ -108,16 +123,22 @@ types.go      Shared data types (InvocationSummary, InvocationRecord, Snapshot)
 
 ```
 === Comparison: my_transformer_func ===
-  Baseline: ./snapshots/pre-deploy.json (label: pre-deploy, captured: 2026-02-25T10:00:00Z)
-  New:      ./snapshots/post-deploy.json (label: post-deploy, captured: 2026-02-25T12:00:00Z)
+  Baseline: ./snapshots/my_transformer_func_pre-deploy.json (label: pre-deploy, captured: 2026-02-25T10:00:00Z)
+  New:      ./snapshots/my_transformer_func_post-deploy.json (label: post-deploy, captured: 2026-02-25T12:00:00Z)
 
---- BASELINE: my_transformer_func [pre-deploy] ---
+--- BASELINE: my_transformer_func [pre-deploy] (log group: /aws/lambda/my_transformer_func) ---
   Invocations captured: 20
   Errors: 0
+  Recent invocations:
+    2026-02-25T09:59:58Z  dur=45.2 ms  peak_mem=85 MB  mem_size=128 MB
+    2026-02-25T09:59:52Z  dur=98.3 ms  peak_mem=90 MB  mem_size=128 MB
 
---- NEW: my_transformer_func [post-deploy] ---
+--- NEW: my_transformer_func [post-deploy] (log group: /aws/lambda/my_transformer_func) ---
   Invocations captured: 20
   Errors: 0
+  Recent invocations:
+    2026-02-25T11:59:59Z  dur=42.1 ms  peak_mem=84 MB  mem_size=128 MB
+    2026-02-25T11:59:54Z  dur=95.0 ms  peak_mem=91 MB  mem_size=128 MB
 
 === Error Comparison ===
   Baseline errors: 0 / 20 invocations
