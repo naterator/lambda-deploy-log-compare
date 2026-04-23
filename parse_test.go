@@ -204,7 +204,7 @@ func TestParseInvocations_ErrorDetection(t *testing.T) {
 	}
 }
 
-func TestParseInvocations_SkipsWithoutReport(t *testing.T) {
+func TestParseInvocations_PreservesWithoutReport(t *testing.T) {
 	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
 
 	events := []types.OutputLogEvent{
@@ -214,8 +214,17 @@ func TestParseInvocations_SkipsWithoutReport(t *testing.T) {
 	}
 
 	got := parseInvocations(events)
-	if len(got) != 0 {
-		t.Errorf("expected 0 invocations (no REPORT), got %d", len(got))
+	if len(got) != 1 {
+		t.Fatalf("expected 1 invocation without REPORT, got %d", len(got))
+	}
+	if got[0].RequestID != "incomplete" {
+		t.Fatalf("RequestID = %q, want %q", got[0].RequestID, "incomplete")
+	}
+	if got[0].Duration != "" || got[0].MaxMemoryUsedMB != "" {
+		t.Fatalf("expected missing REPORT fields to stay empty, got %+v", got[0])
+	}
+	if len(got[0].LogLines) != 1 || got[0].LogLines[0] != "some log" {
+		t.Fatalf("LogLines = %v, want [some log]", got[0].LogLines)
 	}
 }
 
@@ -312,5 +321,27 @@ func TestParseInvocations_IgnoresBenignErrorPhrases(t *testing.T) {
 	}
 	if len(got[0].ErrorLines) != 0 {
 		t.Fatalf("ErrorLines = %v, want none", got[0].ErrorLines)
+	}
+}
+
+func TestParseInvocations_PreservesInlineRequestIDLogsWithoutStartOrReport(t *testing.T) {
+	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+
+	events := []types.OutputLogEvent{
+		{Message: aws.String("worker RequestId: req-inline process exited before completing request"), Timestamp: aws.Int64(ts)},
+	}
+
+	got := parseInvocations(events)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 invocation, got %d", len(got))
+	}
+	if got[0].RequestID != "req-inline" {
+		t.Fatalf("RequestID = %q, want req-inline", got[0].RequestID)
+	}
+	if !got[0].IsError {
+		t.Fatalf("expected inline error log to mark invocation as failed: %+v", got[0])
+	}
+	if len(got[0].ErrorLines) != 1 {
+		t.Fatalf("ErrorLines = %v, want 1 inline error line", got[0].ErrorLines)
 	}
 }

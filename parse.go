@@ -18,6 +18,7 @@ func parseInvocations(events []types.OutputLogEvent) []InvocationSummary {
 		isError         bool
 		errorLines      []string
 		logLines        []string
+		hasStart        bool
 		hasReport       bool
 	}
 
@@ -82,6 +83,7 @@ func parseInvocations(events []types.OutputLogEvent) []InvocationSummary {
 			reqID := extractRequestID(msg, "START RequestId: ")
 			if b := ensureBuilder(reqID, ts); b != nil {
 				b.startTime = ts
+				b.hasStart = true
 			}
 			currentReqID = reqID
 
@@ -109,7 +111,7 @@ func parseInvocations(events []types.OutputLogEvent) []InvocationSummary {
 	var results []InvocationSummary
 	for _, reqID := range order {
 		b := builders[reqID]
-		if !b.hasReport {
+		if !b.hasReport && !b.hasStart && len(b.logLines) == 0 {
 			continue
 		}
 		results = append(results, InvocationSummary{

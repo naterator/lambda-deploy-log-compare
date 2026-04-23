@@ -80,20 +80,36 @@ func TestToRecord(t *testing.T) {
 	}
 }
 
-func TestFetchLogStreams(t *testing.T) {
-	t.Run("single page", func(t *testing.T) {
+func TestFetchLogStreamPage(t *testing.T) {
+	t.Run("returns page and next token", func(t *testing.T) {
 		mock := &mockLogsClient{
 			describeLogStreamsFn: func(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
+				if got := aws.ToString(params.LogGroupName); got != "/aws/lambda/test" {
+					t.Fatalf("LogGroupName = %q, want %q", got, "/aws/lambda/test")
+				}
+				if got := aws.ToInt32(params.Limit); got != 25 {
+					t.Fatalf("Limit = %d, want 25", got)
+				}
+				if params.NextToken == nil || *params.NextToken != "page-1" {
+					t.Fatalf("NextToken = %v, want page-1", aws.ToString(params.NextToken))
+				}
+				if params.OrderBy != types.OrderByLastEventTime {
+					t.Fatalf("OrderBy = %q, want %q", params.OrderBy, types.OrderByLastEventTime)
+				}
+				if !aws.ToBool(params.Descending) {
+					t.Fatalf("Descending = %v, want true", aws.ToBool(params.Descending))
+				}
 				return &cloudwatchlogs.DescribeLogStreamsOutput{
 					LogStreams: []types.LogStream{
 						{LogStreamName: aws.String("stream-1")},
 						{LogStreamName: aws.String("stream-2")},
 					},
+					NextToken: aws.String("page-2"),
 				}, nil
 			},
 		}
 
-		streams, err := fetchLogStreams(context.Background(), mock, "/aws/lambda/test", 10)
+		streams, nextToken, err := fetchLogStreamPage(context.Background(), mock, "/aws/lambda/test", 25, aws.String("page-1"))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -101,40 +117,10 @@ func TestFetchLogStreams(t *testing.T) {
 			t.Fatalf("expected 2 streams, got %d", len(streams))
 		}
 		if *streams[0].LogStreamName != "stream-1" {
-			t.Errorf("first stream = %q, want %q", *streams[0].LogStreamName, "stream-1")
+			t.Fatalf("first stream = %q, want %q", *streams[0].LogStreamName, "stream-1")
 		}
-	})
-
-	t.Run("pagination", func(t *testing.T) {
-		callCount := 0
-		mock := &mockLogsClient{
-			describeLogStreamsFn: func(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
-				callCount++
-				if callCount == 1 {
-					return &cloudwatchlogs.DescribeLogStreamsOutput{
-						LogStreams: []types.LogStream{
-							{LogStreamName: aws.String("stream-1")},
-						},
-						NextToken: aws.String("token-1"),
-					}, nil
-				}
-				return &cloudwatchlogs.DescribeLogStreamsOutput{
-					LogStreams: []types.LogStream{
-						{LogStreamName: aws.String("stream-2")},
-					},
-				}, nil
-			},
-		}
-
-		streams, err := fetchLogStreams(context.Background(), mock, "/aws/lambda/test", 10)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(streams) != 2 {
-			t.Fatalf("expected 2 streams, got %d", len(streams))
-		}
-		if callCount != 2 {
-			t.Errorf("expected 2 API calls, got %d", callCount)
+		if nextToken == nil || *nextToken != "page-2" {
+			t.Fatalf("nextToken = %v, want page-2", aws.ToString(nextToken))
 		}
 	})
 
@@ -145,7 +131,7 @@ func TestFetchLogStreams(t *testing.T) {
 			},
 		}
 
-		_, err := fetchLogStreams(context.Background(), mock, "/aws/lambda/test", 10)
+		_, _, err := fetchLogStreamPage(context.Background(), mock, "/aws/lambda/test", 10, nil)
 		if err == nil {
 			t.Fatal("expected error")
 		}
@@ -158,61 +144,112 @@ func TestFetchLogEvents(t *testing.T) {
 		mock := &mockLogsClient{
 			getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
 				callCount++
-				if callCount == 1 {
-					return &cloudwatchlogs.GetLogEventsOutput{
-						Events: []types.OutputLogEvent{
-							{Message: aws.String("hello"), Timestamp: aws.Int64(1000)},
-						},
-						NextForwardToken: aws.String("token-1"),
-					}, nil
+				if params.NextToken != nil {
+					t.Fatalf("unexpected follow-up page request with token %q", *params.NextToken)
 				}
-				// Second call returns same token — signals end of data
+				if params.StartFromHead == nil || *params.StartFromHead {
+					t.Fatalf("StartFromHead = %v, want false", aws.ToBool(params.StartFromHead))
+				}
+				if got := aws.ToInt32(params.Limit); got != logEventsPageLimit {
+					t.Fatalf("Limit = %d, want %d", got, logEventsPageLimit)
+				}
 				return &cloudwatchlogs.GetLogEventsOutput{
-					NextForwardToken: aws.String("token-1"),
+					Events: latestFirstEvents([]types.OutputLogEvent{
+						{Message: aws.String("START RequestId: req-1 Version: $LATEST"), Timestamp: aws.Int64(1000)},
+						{Message: aws.String("REPORT RequestId: req-1\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(1100)},
+					}),
+					NextBackwardToken: aws.String("token-1"),
 				}, nil
 			},
 		}
 
-		events, err := fetchLogEvents(context.Background(), mock, "/aws/lambda/test", "stream-1")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(events) != 1 {
-			t.Fatalf("expected 1 event, got %d", len(events))
-		}
-	})
-
-	t.Run("pagination stops on same token", func(t *testing.T) {
-		callCount := 0
-		mock := &mockLogsClient{
-			getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
-				callCount++
-				if callCount == 1 {
-					return &cloudwatchlogs.GetLogEventsOutput{
-						Events: []types.OutputLogEvent{
-							{Message: aws.String("event-1"), Timestamp: aws.Int64(1000)},
-						},
-						NextForwardToken: aws.String("token-2"),
-					}, nil
-				}
-				return &cloudwatchlogs.GetLogEventsOutput{
-					Events: []types.OutputLogEvent{
-						{Message: aws.String("event-2"), Timestamp: aws.Int64(2000)},
-					},
-					NextForwardToken: aws.String("token-2"), // same as sent
-				}, nil
-			},
-		}
-
-		events, err := fetchLogEvents(context.Background(), mock, "/aws/lambda/test", "stream-1")
+		events, err := fetchLogEvents(context.Background(), mock, "/aws/lambda/test", "stream-1", 1)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if len(events) != 2 {
 			t.Fatalf("expected 2 events, got %d", len(events))
 		}
+		if got := aws.ToString(events[0].Message); got != "START RequestId: req-1 Version: $LATEST" {
+			t.Fatalf("first event = %q, want START line", got)
+		}
+		if callCount != 1 {
+			t.Fatalf("expected 1 API call, got %d", callCount)
+		}
+	})
+
+	t.Run("paginates backward until enough invocations are available", func(t *testing.T) {
+		callCount := 0
+		mock := &mockLogsClient{
+			getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+				callCount++
+				if callCount == 1 {
+					return &cloudwatchlogs.GetLogEventsOutput{
+						Events: latestFirstEvents([]types.OutputLogEvent{
+							{Message: aws.String("START RequestId: req-b Version: $LATEST"), Timestamp: aws.Int64(3000)},
+							{Message: aws.String("REPORT RequestId: req-b\tDuration: 20 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(3100)},
+						}),
+						NextBackwardToken: aws.String("token-older"),
+					}, nil
+				}
+				if params.NextToken == nil || *params.NextToken != "token-older" {
+					t.Fatalf("NextToken = %v, want token-older", aws.ToString(params.NextToken))
+				}
+				return &cloudwatchlogs.GetLogEventsOutput{
+					Events: latestFirstEvents([]types.OutputLogEvent{
+						{Message: aws.String("START RequestId: req-a Version: $LATEST"), Timestamp: aws.Int64(1000)},
+						{Message: aws.String("REPORT RequestId: req-a\tDuration: 10 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(1100)},
+					}),
+					NextBackwardToken: aws.String("token-oldest"),
+				}, nil
+			},
+		}
+
+		events, err := fetchLogEvents(context.Background(), mock, "/aws/lambda/test", "stream-1", 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(events) != 4 {
+			t.Fatalf("expected 4 events, got %d", len(events))
+		}
 		if callCount != 2 {
 			t.Errorf("expected 2 API calls, got %d", callCount)
+		}
+	})
+
+	t.Run("stops when the backward token stops moving", func(t *testing.T) {
+		callCount := 0
+		mock := &mockLogsClient{
+			getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+				callCount++
+				if callCount == 1 {
+					return &cloudwatchlogs.GetLogEventsOutput{
+						Events: latestFirstEvents([]types.OutputLogEvent{
+							{Message: aws.String("START RequestId: req-1 Version: $LATEST"), Timestamp: aws.Int64(1000)},
+							{Message: aws.String("REPORT RequestId: req-1\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(1100)},
+						}),
+						NextBackwardToken: aws.String("token-final"),
+					}, nil
+				}
+				return &cloudwatchlogs.GetLogEventsOutput{
+					Events: latestFirstEvents([]types.OutputLogEvent{
+						{Message: aws.String("START RequestId: req-1 Version: $LATEST"), Timestamp: aws.Int64(1000)},
+						{Message: aws.String("REPORT RequestId: req-1\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(1100)},
+					}),
+					NextBackwardToken: aws.String("token-final"),
+				}, nil
+			},
+		}
+
+		events, err := fetchLogEvents(context.Background(), mock, "/aws/lambda/test", "stream-1", 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(events) != 2 {
+			t.Fatalf("expected 2 events without terminal duplication, got %d", len(events))
+		}
+		if callCount != 2 {
+			t.Fatalf("expected 2 API calls, got %d", callCount)
 		}
 	})
 
@@ -223,7 +260,7 @@ func TestFetchLogEvents(t *testing.T) {
 			},
 		}
 
-		_, err := fetchLogEvents(context.Background(), mock, "/aws/lambda/test", "stream-1")
+		_, err := fetchLogEvents(context.Background(), mock, "/aws/lambda/test", "stream-1", 1)
 		if err == nil {
 			t.Fatal("expected error")
 		}
@@ -242,20 +279,17 @@ func TestRunCapture(t *testing.T) {
 			}, nil
 		},
 		getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
-			return &cloudwatchlogs.GetLogEventsOutput{
-				Events: []types.OutputLogEvent{
-					{Message: aws.String("START RequestId: req-1 Version: $LATEST"), Timestamp: aws.Int64(ts)},
-					{Message: aws.String("processing"), Timestamp: aws.Int64(ts + 100)},
-					{Message: aws.String("END RequestId: req-1"), Timestamp: aws.Int64(ts + 200)},
-					{Message: aws.String("REPORT RequestId: req-1\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(ts + 300)},
-				},
-				NextForwardToken: aws.String("done"),
-			}, nil
+			return singleTailPage([]types.OutputLogEvent{
+				{Message: aws.String("START RequestId: req-1 Version: $LATEST"), Timestamp: aws.Int64(ts)},
+				{Message: aws.String("processing"), Timestamp: aws.Int64(ts + 100)},
+				{Message: aws.String("END RequestId: req-1"), Timestamp: aws.Int64(ts + 200)},
+				{Message: aws.String("REPORT RequestId: req-1\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(ts + 300)},
+			})(ctx, params, optFns...)
 		},
 	}
 
 	outDir := t.TempDir()
-	err := runCapture(mock, "test-func", "/aws/lambda/test-func", 5, 0, "test-label", outDir)
+	err := runCapture(mock, "test-func", "/aws/lambda/test-func", 1, 0, "test-label", outDir)
 	if err != nil {
 		t.Fatalf("runCapture error: %v", err)
 	}
@@ -320,13 +354,10 @@ func TestRunCapture_CreatesOutputDirectory(t *testing.T) {
 			}, nil
 		},
 		getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
-			return &cloudwatchlogs.GetLogEventsOutput{
-				Events: []types.OutputLogEvent{
-					{Message: aws.String("START RequestId: req-1 Version: $LATEST"), Timestamp: aws.Int64(ts)},
-					{Message: aws.String("REPORT RequestId: req-1\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(ts + 100)},
-				},
-				NextForwardToken: aws.String("done"),
-			}, nil
+			return singleTailPage([]types.OutputLogEvent{
+				{Message: aws.String("START RequestId: req-1 Version: $LATEST"), Timestamp: aws.Int64(ts)},
+				{Message: aws.String("REPORT RequestId: req-1\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(ts + 100)},
+			})(ctx, params, optFns...)
 		},
 	}
 
@@ -369,9 +400,12 @@ func TestRunCapture_SelectsMostRecentInvocationsAfterOffset(t *testing.T) {
 			}, nil
 		},
 		getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+			if params.NextToken != nil {
+				return &cloudwatchlogs.GetLogEventsOutput{NextBackwardToken: params.NextToken}, nil
+			}
 			return &cloudwatchlogs.GetLogEventsOutput{
-				Events:           streamEvents[*params.LogStreamName],
-				NextForwardToken: aws.String("done"),
+				Events:            latestFirstEvents(streamEvents[*params.LogStreamName]),
+				NextBackwardToken: aws.String("tail-" + *params.LogStreamName),
 			}, nil
 		},
 	}
@@ -398,6 +432,43 @@ func TestRunCapture_SelectsMostRecentInvocationsAfterOffset(t *testing.T) {
 	want := []string{"req-2", "req-1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("request IDs = %v, want %v", got, want)
+	}
+}
+
+func TestRunCapture_SanitizesSnapshotFilename(t *testing.T) {
+	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+
+	mock := &mockLogsClient{
+		describeLogStreamsFn: func(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
+			return &cloudwatchlogs.DescribeLogStreamsOutput{
+				LogStreams: []types.LogStream{{LogStreamName: aws.String("stream-1")}},
+			}, nil
+		},
+		getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+			return singleTailPage([]types.OutputLogEvent{
+				{Message: aws.String("START RequestId: req-1 Version: $LATEST"), Timestamp: aws.Int64(ts)},
+				{Message: aws.String("REPORT RequestId: req-1\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(ts + 100)},
+			})(ctx, params, optFns...)
+		},
+	}
+
+	outDir := t.TempDir()
+	if err := runCapture(mock, "../team/service", "/aws/lambda/test-func", 1, 0, "../../prod/release", outDir); err != nil {
+		t.Fatalf("runCapture error: %v", err)
+	}
+
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("ReadDir error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 output entry, got %d", len(entries))
+	}
+	if entries[0].IsDir() {
+		t.Fatalf("expected a file, got directory %q", entries[0].Name())
+	}
+	if got, want := entries[0].Name(), "team_service_prod_release.json"; got != want {
+		t.Fatalf("output filename = %q, want %q", got, want)
 	}
 }
 
@@ -461,8 +532,11 @@ func TestRunCapture_PaginatesStreamsUntilItFindsOlderInvocations(t *testing.T) {
 		},
 		getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
 			name := *params.LogStreamName
+			if params.NextToken != nil {
+				return &cloudwatchlogs.GetLogEventsOutput{NextBackwardToken: params.NextToken}, nil
+			}
 			if name < "stream-056" {
-				return &cloudwatchlogs.GetLogEventsOutput{NextForwardToken: aws.String("done")}, nil
+				return &cloudwatchlogs.GetLogEventsOutput{NextBackwardToken: aws.String("tail-" + name)}, nil
 			}
 
 			streamIndex := 0
@@ -470,11 +544,11 @@ func TestRunCapture_PaginatesStreamsUntilItFindsOlderInvocations(t *testing.T) {
 			ts := base + int64((61-streamIndex)*1000)
 			reqID := fmt.Sprintf("req-%03d", streamIndex)
 			return &cloudwatchlogs.GetLogEventsOutput{
-				Events: []types.OutputLogEvent{
+				Events: latestFirstEvents([]types.OutputLogEvent{
 					{Message: aws.String("START RequestId: " + reqID + " Version: $LATEST"), Timestamp: aws.Int64(ts)},
 					{Message: aws.String(fmt.Sprintf("REPORT RequestId: %s\tDuration: %d ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB", reqID, streamIndex)), Timestamp: aws.Int64(ts + 100)},
-				},
-				NextForwardToken: aws.String("done"),
+				}),
+				NextBackwardToken: aws.String("tail-" + name),
 			}, nil
 		},
 	}
@@ -504,5 +578,23 @@ func TestRunCapture_PaginatesStreamsUntilItFindsOlderInvocations(t *testing.T) {
 	want := []string{"req-057", "req-058", "req-059"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("request IDs = %v, want %v", got, want)
+	}
+}
+
+func latestFirstEvents(events []types.OutputLogEvent) []types.OutputLogEvent {
+	page := append([]types.OutputLogEvent(nil), events...)
+	reverseLogEvents(page)
+	return page
+}
+
+func singleTailPage(events []types.OutputLogEvent) func(context.Context, *cloudwatchlogs.GetLogEventsInput, ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+	return func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+		if params.NextToken != nil {
+			return &cloudwatchlogs.GetLogEventsOutput{NextBackwardToken: params.NextToken}, nil
+		}
+		return &cloudwatchlogs.GetLogEventsOutput{
+			Events:            latestFirstEvents(events),
+			NextBackwardToken: aws.String("tail-1"),
+		}, nil
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const maxPatternDisplay = 20
@@ -34,9 +35,11 @@ func runCompareWithOptions(fileA, fileB string, opts CompareOptions) error {
 		return fmt.Errorf("strict comparison failed: %s", strings.Join(warnings, "; "))
 	}
 
-	fmt.Fprintf(stdout, "=== Comparison: %s ===\n", snapA.FunctionName)
-	fmt.Fprintf(stdout, "  Baseline: %s (label: %s, captured: %s)\n", fileA, snapA.Label, snapA.CapturedAt)
-	fmt.Fprintf(stdout, "  New:      %s (label: %s, captured: %s)\n\n", fileB, snapB.Label, snapB.CapturedAt)
+	displayNamesDiffer := snapshotDisplayName(snapA) != snapshotDisplayName(snapB)
+	fmt.Fprintf(stdout, "=== Comparison: %s ===\n", comparisonTitle(snapA, snapB))
+	printSnapshotSource("Baseline", fileA, snapA, displayNamesDiffer)
+	printSnapshotSource("New", fileB, snapB, displayNamesDiffer)
+	fmt.Fprintln(stdout)
 	for _, warning := range warnings {
 		fmt.Fprintf(stdout, "  WARNING: %s\n", warning)
 	}
@@ -136,6 +139,7 @@ func loadSnapshot(path string) (Snapshot, error) {
 	}
 	var snap Snapshot
 	err = json.Unmarshal(data, &snap)
+	snap.Invocations = sortedInvocations(snap.Invocations)
 	return snap, err
 }
 
@@ -144,15 +148,78 @@ func printSnapshotSummary(label string, snap Snapshot) {
 	fmt.Fprintf(stdout, "  Invocations captured: %d\n", len(snap.Invocations))
 	fmt.Fprintf(stdout, "  Errors: %d\n", countErrors(snap))
 
-	if len(snap.Invocations) > 0 {
+	invocations := sortedInvocations(snap.Invocations)
+	if len(invocations) > 0 {
 		fmt.Fprintln(stdout, "  Recent invocations:")
-		for i, inv := range snap.Invocations {
+		for i, inv := range invocations {
 			if i >= 5 {
 				break
 			}
 			fmt.Fprintln(stdout, formatInvocationSummary(inv))
 		}
 	}
+}
+
+func comparisonTitle(snapA, snapB Snapshot) string {
+	nameA := snapshotDisplayName(snapA)
+	nameB := snapshotDisplayName(snapB)
+	if nameA == nameB {
+		return nameA
+	}
+	return fmt.Sprintf("%s vs %s", nameA, nameB)
+}
+
+func printSnapshotSource(label, path string, snap Snapshot, includeDisplayName bool) {
+	if includeDisplayName {
+		fmt.Fprintf(stdout, "  %-10s%s (%s, label: %s, captured: %s)\n", label+":", path, snapshotDisplayName(snap), snap.Label, snap.CapturedAt)
+		return
+	}
+	fmt.Fprintf(stdout, "  %-10s%s (label: %s, captured: %s)\n", label+":", path, snap.Label, snap.CapturedAt)
+}
+
+func snapshotDisplayName(snap Snapshot) string {
+	switch {
+	case snap.FunctionName != "":
+		return snap.FunctionName
+	case snap.LogGroup != "":
+		return snap.LogGroup
+	default:
+		return "unknown snapshot"
+	}
+}
+
+func sortedInvocations(invocations []InvocationRecord) []InvocationRecord {
+	sorted := append([]InvocationRecord(nil), invocations...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		tsI, okI := parseInvocationTimestamp(sorted[i].Timestamp)
+		tsJ, okJ := parseInvocationTimestamp(sorted[j].Timestamp)
+
+		switch {
+		case okI && okJ:
+			if tsI.Equal(tsJ) {
+				return false
+			}
+			return tsI.After(tsJ)
+		case okI:
+			return true
+		case okJ:
+			return false
+		default:
+			return sorted[i].Timestamp > sorted[j].Timestamp
+		}
+	})
+	return sorted
+}
+
+func parseInvocationTimestamp(timestamp string) (time.Time, bool) {
+	if timestamp == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
 }
 
 func comparisonWarnings(snapA, snapB Snapshot) []string {

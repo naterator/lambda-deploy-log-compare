@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +26,47 @@ func TestRun_ShowsUsageOnMissingCommand(t *testing.T) {
 	}
 	if !strings.Contains(stderrText, "capture") || !strings.Contains(stderrText, "compare") {
 		t.Fatalf("stderr missing command list: %s", stderrText)
+	}
+}
+
+func TestRun_FlagExitPaths(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantStderr []string
+	}{
+		{
+			name:       "capture help",
+			args:       []string{"capture", "-h"},
+			wantStderr: []string{"Usage:", "capture", "compare"},
+		},
+		{
+			name:       "compare help",
+			args:       []string{"compare", "-h"},
+			wantStderr: []string{"Usage:", "capture", "compare"},
+		},
+		{
+			name:       "capture invalid flag",
+			args:       []string{"capture", "--bogus"},
+			wantStderr: []string{"flag provided but not defined", "Usage:"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, stdoutText, stderrText := runCLI(t, tt.args)
+			if code != 1 {
+				t.Fatalf("exit code = %d, want 1", code)
+			}
+			if stdoutText != "" {
+				t.Fatalf("stdout = %q, want empty", stdoutText)
+			}
+			for _, want := range tt.wantStderr {
+				if !strings.Contains(stderrText, want) {
+					t.Fatalf("stderr missing %q: %s", want, stderrText)
+				}
+			}
+		})
 	}
 }
 
@@ -112,6 +154,47 @@ func TestRun_CompareStrictFlag(t *testing.T) {
 	}
 }
 
+func TestRun_CaptureDuplicateFunctionsFails(t *testing.T) {
+	oldFactory := logsClientFactory
+	defer func() { logsClientFactory = oldFactory }()
+
+	logsClientFactory = func(region, profile string) (LogsClient, error) {
+		t.Fatal("logsClientFactory should not be called when capture input validation fails")
+		return nil, nil
+	}
+
+	code, stdoutText, stderrText := runCLI(t, []string{"capture", "--function", "func-a, func-a", "--label", "baseline"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if stdoutText != "" {
+		t.Fatalf("stdout = %q, want empty", stdoutText)
+	}
+	if !strings.Contains(stderrText, `--function contains duplicate name "func-a"`) {
+		t.Fatalf("stderr missing duplicate-name validation: %s", stderrText)
+	}
+}
+
+func TestRun_CaptureAWSClientInitFailure(t *testing.T) {
+	oldFactory := logsClientFactory
+	defer func() { logsClientFactory = oldFactory }()
+
+	logsClientFactory = func(region, profile string) (LogsClient, error) {
+		return nil, errors.New("boom")
+	}
+
+	code, stdoutText, stderrText := runCLI(t, []string{"capture", "--function", "func-a", "--label", "baseline"})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if stdoutText != "" {
+		t.Fatalf("stdout = %q, want empty", stdoutText)
+	}
+	if !strings.Contains(stderrText, "Error initializing AWS client: boom") {
+		t.Fatalf("stderr missing AWS init failure: %s", stderrText)
+	}
+}
+
 func runCLI(t *testing.T, args []string) (int, string, string) {
 	t.Helper()
 
@@ -136,6 +219,12 @@ func newCLIClient(ts int64, requestID string, logLines []string, isError bool) L
 			}, nil
 		},
 		getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+			if params.NextToken != nil {
+				return &cloudwatchlogs.GetLogEventsOutput{
+					NextBackwardToken: params.NextToken,
+				}, nil
+			}
+
 			events := []types.OutputLogEvent{
 				{Message: aws.String("START RequestId: " + requestID + " Version: $LATEST"), Timestamp: aws.Int64(ts)},
 			}
@@ -155,9 +244,11 @@ func newCLIClient(ts int64, requestID string, logLines []string, isError bool) L
 					Timestamp: aws.Int64(ts + 1100),
 				})
 			}
+			latestFirst := append([]types.OutputLogEvent(nil), events...)
+			reverseLogEvents(latestFirst)
 			return &cloudwatchlogs.GetLogEventsOutput{
-				Events:           events,
-				NextForwardToken: aws.String("done"),
+				Events:            latestFirst,
+				NextBackwardToken: aws.String("tail-1"),
 			}, nil
 		},
 	}

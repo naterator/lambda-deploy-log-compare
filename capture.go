@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
@@ -18,6 +20,8 @@ type LogsClient interface {
 	DescribeLogStreams(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error)
 	GetLogEvents(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error)
 }
+
+const logEventsPageLimit int32 = 10_000
 
 func logGroupForFunction(name string) string {
 	return "/aws/lambda/" + name
@@ -67,7 +71,7 @@ func runCapture(client LogsClient, funcName, logGroup string, count, offset int,
 			processedStreams++
 
 			evCtx, evCancel := context.WithTimeout(ctx, 30*time.Second)
-			events, err := fetchLogEvents(evCtx, client, logGroup, *stream.LogStreamName)
+			events, err := fetchLogEvents(evCtx, client, logGroup, *stream.LogStreamName, needed-len(allInvocations))
 			evCancel()
 			if err != nil {
 				fmt.Fprintf(stderr, "  Warning: failed to get events from stream %s: %v\n", *stream.LogStreamName, err)
@@ -114,7 +118,7 @@ func runCapture(client LogsClient, funcName, logGroup string, count, offset int,
 		Invocations:  records,
 	}
 
-	outPath := filepath.Join(outDir, fmt.Sprintf("%s_%s.json", funcName, label))
+	outPath := filepath.Join(outDir, snapshotFileName(funcName, label))
 	data, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
@@ -144,34 +148,11 @@ func fetchLogStreamPage(ctx context.Context, client LogsClient, logGroup string,
 	return out.LogStreams, out.NextToken, nil
 }
 
-func fetchLogStreams(ctx context.Context, client LogsClient, logGroup string, limit int) ([]types.LogStream, error) {
-	var allStreams []types.LogStream
-	var nextToken *string
-
-	for {
-		pageLimit := int32(50)
-		remaining := limit - len(allStreams)
-		if remaining <= 0 {
-			break
-		}
-		if remaining < int(pageLimit) {
-			pageLimit = int32(remaining)
-		}
-
-		streams, newToken, err := fetchLogStreamPage(ctx, client, logGroup, pageLimit, nextToken)
-		if err != nil {
-			return allStreams, err
-		}
-		allStreams = append(allStreams, streams...)
-		nextToken = newToken
-		if nextToken == nil || len(streams) == 0 {
-			break
-		}
+func fetchLogEvents(ctx context.Context, client LogsClient, logGroup, streamName string, neededInvocations int) ([]types.OutputLogEvent, error) {
+	if neededInvocations <= 0 {
+		neededInvocations = 1
 	}
-	return allStreams, nil
-}
 
-func fetchLogEvents(ctx context.Context, client LogsClient, logGroup, streamName string) ([]types.OutputLogEvent, error) {
 	var allEvents []types.OutputLogEvent
 	var nextToken *string
 
@@ -179,22 +160,71 @@ func fetchLogEvents(ctx context.Context, client LogsClient, logGroup, streamName
 		out, err := client.GetLogEvents(ctx, &cloudwatchlogs.GetLogEventsInput{
 			LogGroupName:  &logGroup,
 			LogStreamName: &streamName,
-			StartFromHead: aws.Bool(true),
+			Limit:         aws.Int32(logEventsPageLimit),
+			StartFromHead: aws.Bool(false),
 			NextToken:     nextToken,
 		})
 		if err != nil {
 			return allEvents, err
 		}
-		allEvents = append(allEvents, out.Events...)
 
-		// GetLogEvents always returns a nextForwardToken; it stops when
-		// the token is the same as the one we sent in.
-		if out.NextForwardToken == nil || (nextToken != nil && *out.NextForwardToken == *nextToken) {
+		// When the backward token stops moving, the API has no older events to page in.
+		// Some terminal responses can repeat the current position, so skip appending them.
+		if nextToken != nil && out.NextBackwardToken != nil && *out.NextBackwardToken == *nextToken {
 			break
 		}
-		nextToken = out.NextForwardToken
+
+		if len(out.Events) > 0 {
+			pageEvents := append([]types.OutputLogEvent(nil), out.Events...)
+			reverseLogEvents(pageEvents)
+			allEvents = append(pageEvents, allEvents...)
+
+			if len(parseInvocations(allEvents)) >= neededInvocations {
+				break
+			}
+		}
+
+		if out.NextBackwardToken == nil {
+			break
+		}
+		nextToken = out.NextBackwardToken
 	}
 	return allEvents, nil
+}
+
+func reverseLogEvents(events []types.OutputLogEvent) {
+	for left, right := 0, len(events)-1; left < right; left, right = left+1, right-1 {
+		events[left], events[right] = events[right], events[left]
+	}
+}
+
+func snapshotFileName(funcName, label string) string {
+	return fmt.Sprintf("%s_%s.json", sanitizeFileComponent(funcName, "function"), sanitizeFileComponent(label, "snapshot"))
+}
+
+func sanitizeFileComponent(raw, fallback string) string {
+	raw = strings.TrimSpace(raw)
+
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range raw {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r), r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+			lastUnderscore = false
+		default:
+			if !lastUnderscore {
+				b.WriteByte('_')
+				lastUnderscore = true
+			}
+		}
+	}
+
+	sanitized := strings.Trim(b.String(), "._-")
+	if sanitized == "" || sanitized == "." || sanitized == ".." {
+		return fallback
+	}
+	return sanitized
 }
 
 func selectInvocations(allInvocations []InvocationSummary, count, offset int) []InvocationSummary {

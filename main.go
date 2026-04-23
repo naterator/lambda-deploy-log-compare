@@ -26,7 +26,7 @@ func run(args []string) int {
 	captureCmd := flag.NewFlagSet("capture", flag.ContinueOnError)
 	captureCmd.SetOutput(stderr)
 	captureCmd.Usage = func() { printUsage() }
-	captureFunc := captureCmd.String("function", "", "Lambda function name(s), comma-separated")
+	captureFunc := captureCmd.String("function", "", "Unique Lambda function name(s), comma-separated")
 	captureCount := captureCmd.Int("count", 20, "Number of invocations to capture")
 	captureOffset := captureCmd.Int("offset", 0, "Skip this many recent invocations before capturing (e.g., 100 to go back 100 runs)")
 	captureLabel := captureCmd.String("label", "", "Label for this snapshot (e.g., 'pre-deploy', 'post-deploy-staging')")
@@ -112,7 +112,7 @@ Commands:
   compare   Compare two snapshots side-by-side
 
 Capture options:
-  --function   Lambda function name(s), comma-separated (required)
+  --function   Unique Lambda function name(s), comma-separated (required)
   --label      Label for this snapshot, e.g. "pre-deploy" (required)
   --count      Number of invocations to capture; must be > 0 (default: 20)
   --offset     Skip this many recent invocations before capturing; must be >= 0 (default: 0)
@@ -164,9 +164,24 @@ func validateCaptureInputs(functions []string, label string, count, offset int) 
 		return fmt.Errorf("--count must be greater than 0")
 	case offset < 0:
 		return fmt.Errorf("--offset must be greater than or equal to 0")
-	default:
-		return nil
 	}
+
+	if dup := firstDuplicate(functions); dup != "" {
+		return fmt.Errorf("--function contains duplicate name %q", dup)
+	}
+
+	return nil
+}
+
+func firstDuplicate(values []string) string {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			return value
+		}
+		seen[value] = struct{}{}
+	}
+	return ""
 }
 
 func newLogsClient(region, profile string) (LogsClient, error) {

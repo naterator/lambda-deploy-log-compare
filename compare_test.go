@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -142,6 +143,45 @@ func TestLoadSnapshot(t *testing.T) {
 	}
 }
 
+func TestLoadSnapshot_SortsInvocationsNewestFirst(t *testing.T) {
+	snap := Snapshot{
+		FunctionName: "test-func",
+		LogGroup:     "/aws/lambda/test-func",
+		CapturedAt:   "2026-02-25T10:00:00Z",
+		Label:        "test-label",
+		Invocations: []InvocationRecord{
+			{RequestID: "req-oldest", Timestamp: "2026-02-25T10:01:00Z"},
+			{RequestID: "req-newest", Timestamp: "2026-02-25T10:03:00Z"},
+			{RequestID: "req-middle", Timestamp: "2026-02-25T10:02:00Z"},
+		},
+	}
+
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tmpFile := filepath.Join(t.TempDir(), "unordered-snapshot.json")
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadSnapshot(tmpFile)
+	if err != nil {
+		t.Fatalf("loadSnapshot error: %v", err)
+	}
+
+	got := []string{
+		loaded.Invocations[0].RequestID,
+		loaded.Invocations[1].RequestID,
+		loaded.Invocations[2].RequestID,
+	}
+	want := []string{"req-newest", "req-middle", "req-oldest"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("request IDs = %v, want %v", got, want)
+	}
+}
+
 func TestLoadSnapshot_FileNotFound(t *testing.T) {
 	_, err := loadSnapshot("/nonexistent/path.json")
 	if err == nil {
@@ -274,12 +314,12 @@ func TestPrintSnapshotSummary_ShowsMostRecentInvocationsFirst(t *testing.T) {
 		LogGroup:     "/aws/lambda/test-func",
 		Label:        "baseline",
 		Invocations: []InvocationRecord{
-			{Timestamp: "2026-02-25T10:06:00Z", Duration: "60 ms", MaxMemoryUsedMB: "96 MB", MemorySizeMB: "128 MB"},
-			{Timestamp: "2026-02-25T10:05:00Z", Duration: "50 ms", MaxMemoryUsedMB: "95 MB", MemorySizeMB: "128 MB"},
-			{Timestamp: "2026-02-25T10:04:00Z", Duration: "40 ms", MaxMemoryUsedMB: "94 MB", MemorySizeMB: "128 MB"},
 			{Timestamp: "2026-02-25T10:03:00Z", Duration: "30 ms", MaxMemoryUsedMB: "93 MB", MemorySizeMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:06:00Z", Duration: "60 ms", MaxMemoryUsedMB: "96 MB", MemorySizeMB: "128 MB"},
 			{Timestamp: "2026-02-25T10:02:00Z", Duration: "20 ms", MaxMemoryUsedMB: "92 MB", MemorySizeMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:05:00Z", Duration: "50 ms", MaxMemoryUsedMB: "95 MB", MemorySizeMB: "128 MB"},
 			{Timestamp: "2026-02-25T10:01:00Z", Duration: "10 ms", MaxMemoryUsedMB: "91 MB", MemorySizeMB: "128 MB"},
+			{Timestamp: "2026-02-25T10:04:00Z", Duration: "40 ms", MaxMemoryUsedMB: "94 MB", MemorySizeMB: "128 MB"},
 		},
 	}
 
@@ -336,6 +376,15 @@ func TestRunCompare_WarnsOnMismatchedSnapshots(t *testing.T) {
 	}
 	if !strings.Contains(output, "WARNING: snapshot log groups differ (/aws/lambda/func-a vs /aws/lambda/func-b)") {
 		t.Fatalf("output missing log-group warning: %s", output)
+	}
+	if !strings.Contains(output, "=== Comparison: func-a vs func-b ===") {
+		t.Fatalf("output missing comparison title: %s", output)
+	}
+	if !strings.Contains(output, "Baseline: "+fileA+" (func-a, label: baseline, captured: 2026-02-25T10:00:00Z)") {
+		t.Fatalf("output missing baseline snapshot identity: %s", output)
+	}
+	if !strings.Contains(output, "New:      "+fileB+" (func-b, label: new, captured: 2026-02-25T12:00:00Z)") {
+		t.Fatalf("output missing new snapshot identity: %s", output)
 	}
 }
 
@@ -491,6 +540,73 @@ func TestPrintMemoryStats_IgnoresMalformedValues(t *testing.T) {
 	})
 	if !strings.Contains(output, "ignored=1 malformed") {
 		t.Fatalf("output missing malformed count: %s", output)
+	}
+}
+
+func TestRunCompare_NoUsableDurationOrMemoryData(t *testing.T) {
+	snapA := Snapshot{
+		FunctionName: "test-func",
+		LogGroup:     "/aws/lambda/test-func",
+		CapturedAt:   "2026-02-25T10:00:00Z",
+		Label:        "baseline",
+		Invocations: []InvocationRecord{
+			{
+				RequestID: "req-1",
+				Timestamp: "2026-02-25T10:00:00Z",
+				LogLines:  []string{"starting"},
+			},
+		},
+	}
+	snapB := Snapshot{
+		FunctionName: "test-func",
+		LogGroup:     "/aws/lambda/test-func",
+		CapturedAt:   "2026-02-25T12:00:00Z",
+		Label:        "new",
+		Invocations: []InvocationRecord{
+			{
+				RequestID:       "req-2",
+				Timestamp:       "2026-02-25T12:00:00Z",
+				Duration:        "bad-duration",
+				MaxMemoryUsedMB: "bad-memory",
+				LogLines:        []string{"starting"},
+			},
+		},
+	}
+
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "a.json")
+	fileB := filepath.Join(dir, "b.json")
+	for _, pair := range []struct {
+		path string
+		snap Snapshot
+	}{
+		{fileA, snapA},
+		{fileB, snapB},
+	} {
+		data, err := json.MarshalIndent(pair.snap, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(pair.path, data, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	output := captureStdout(t, func() {
+		if err := runCompare(fileA, fileB); err != nil {
+			t.Fatalf("runCompare error: %v", err)
+		}
+	})
+
+	for _, want := range []string{
+		"Baseline: no duration data",
+		"New     : no duration data (ignored=1 malformed)",
+		"Baseline: no memory data",
+		"New     : no memory data (ignored=1 malformed)",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q:\n%s", want, output)
+		}
 	}
 }
 

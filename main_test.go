@@ -33,6 +33,33 @@ func TestParseFunctionNames(t *testing.T) {
 	}
 }
 
+func TestFirstDuplicate(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []string
+		want   string
+	}{
+		{
+			name:   "no duplicates",
+			values: []string{"func-a", "func-b"},
+			want:   "",
+		},
+		{
+			name:   "duplicate found",
+			values: []string{"func-a", "func-b", "func-a", "func-c"},
+			want:   "func-a",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := firstDuplicate(tt.values); got != tt.want {
+				t.Fatalf("firstDuplicate(%v) = %q, want %q", tt.values, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidateCaptureInputs(t *testing.T) {
 	validFunctions := []string{"func-a"}
 
@@ -77,6 +104,13 @@ func TestValidateCaptureInputs(t *testing.T) {
 			count:     10,
 			offset:    -1,
 			wantErr:   "--offset must be greater than or equal to 0",
+		},
+		{
+			name:      "duplicate function name",
+			functions: []string{"func-a", "func-a"},
+			label:     "pre-deploy",
+			count:     10,
+			wantErr:   "--function contains duplicate name \"func-a\"",
 		},
 	}
 

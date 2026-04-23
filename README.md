@@ -50,7 +50,7 @@ lambda-deploy-log-compare capture --function <name>[,<name>,...] --label <label>
 
 | Flag | Default | Description |
 |---|---|---|
-| `--function` | | Lambda function name(s), comma-separated (required) |
+| `--function` | | Unique Lambda function name(s), comma-separated (required) |
 | `--label` | | Label for the snapshot, e.g. `pre-deploy` (required) |
 | `--count` | `20` | Number of invocations to capture. Must be greater than `0`. |
 | `--offset` | `0` | Skip this many recent invocations before capturing. Must be `0` or greater. |
@@ -60,7 +60,9 @@ lambda-deploy-log-compare capture --function <name>[,<name>,...] --label <label>
 
 Log groups are derived as `/aws/lambda/<function-name>`.
 
-Output files are named `<function-name>_<label>.json` in the output directory. Each function gets its own snapshot file, and the output directory is created automatically when a snapshot is written.
+Duplicate function names are rejected so one capture run cannot silently rescan the same Lambda and overwrite the same snapshot path.
+
+Output files are named from sanitized `<function-name>_<label>.json` components in the output directory. Path separators and traversal-style input such as `..` are rewritten so snapshot writes stay inside the chosen output directory. Each function gets its own snapshot file, and the output directory is created automatically when a snapshot is written.
 
 The `--offset` flag lets you look further back in time. For example, `--offset 100 --count 20` skips the 100 most recent invocations and captures the 20 after that. This is useful for grabbing a historical baseline to compare against.
 
@@ -98,6 +100,7 @@ Important field notes:
 - `duration` and `billed_ms` come from Lambda `REPORT` lines.
 - `memory_size_mb` stores Lambda `Memory Size`, which is the configured memory size for the function.
 - `max_memory_used_mb` stores Lambda `Max Memory Used`, which is the value used for memory comparison stats and `peak_mem` in compare output.
+- Invocations that never emit a `REPORT` line are still captured, with blank duration and memory fields, so crashes and truncated runs are not silently dropped.
 - Older snapshots that used `mem_used_mb` and `max_mem_mb` still load correctly.
 
 ## AWS Authentication
@@ -112,7 +115,7 @@ The IAM principal needs these permissions:
 ## How It Works
 
 1. **Stream discovery** — Fetches recent log streams ordered by last event time (most recent first) page by page until the requested `offset + count` is satisfied or the log group is exhausted.
-2. **Invocation parsing** — Reads events from each stream, tracks invocations from Lambda `START` and `REPORT` markers, and uses inline `RequestId` hints plus current stream context to associate log lines that land outside the normal `START -> logs -> REPORT` sequence. Extracts duration, billed duration, memory size, and max memory used from `REPORT` lines. Each stream gets a 30-second timeout, and collection stops early once enough invocations are found.
+2. **Invocation parsing** — Reads each stream from newest events backward, tracks invocations from Lambda `START` and `REPORT` markers, and uses inline `RequestId` hints plus current stream context to associate log lines that land outside the normal `START -> logs -> REPORT` sequence. Extracts duration, billed duration, memory size, and max memory used from `REPORT` lines when present, while still preserving recent invocations that crashed or were truncated before `REPORT`. Each stream gets a 30-second timeout, and collection stops early once enough invocations are found.
 3. **Error detection** — Flags explicit error-style log lines such as `error`, `panic`, `fatal`, `traceback`, `exception`, and Lambda runtime failure messages, while skipping common benign counter-style phrases like `error_count=0`.
 4. **Snapshot selection** — From all discovered invocations (sorted by time, most recent first), skips the first `offset` invocations, then takes the next `count`.
 5. **Pattern normalization** — For comparison, log lines are normalized by collapsing UUID-like hex strings (32+ chars) to `<UUID>` and truncating to 100 characters. This lets you compare structural patterns rather than exact values.
