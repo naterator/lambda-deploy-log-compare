@@ -1,8 +1,12 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 )
 
 func TestParseFunctionNames(t *testing.T) {
@@ -130,5 +134,29 @@ func TestValidateCaptureInputs(t *testing.T) {
 				t.Fatalf("validateCaptureInputs error = %q, want %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestNewLogsClient_InstantiatesCloudWatchLogsClient(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config")
+	credentialsPath := filepath.Join(dir, "credentials")
+	if err := os.WriteFile(configPath, []byte("[default]\nregion = us-east-1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credentialsPath, []byte("[default]\naws_access_key_id = test\naws_secret_access_key = test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_CONFIG_FILE", configPath)
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", credentialsPath)
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	t.Setenv("AWS_PROFILE", "")
+
+	client, err := newLogsClient("us-east-1", "")
+	if err != nil {
+		t.Fatalf("newLogsClient error: %v", err)
+	}
+	if _, ok := client.(*cloudwatchlogs.Client); !ok {
+		t.Fatalf("newLogsClient returned %T, want *cloudwatchlogs.Client", client)
 	}
 }

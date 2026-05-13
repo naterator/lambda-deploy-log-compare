@@ -80,16 +80,18 @@ lambda-deploy-log-compare compare --a <baseline.json> --b <new.json> [options]
 |---|---|---|
 | `--a` | | Path to baseline snapshot JSON file (required) |
 | `--b` | | Path to new snapshot JSON file (required) |
-| `--strict` | `false` | Fail if the two snapshots disagree on function name or log group |
+| `--strict` | `false` | Fail if either snapshot is missing `function_name` / `log_group`, or if those fields disagree |
+| `--fail-on-regression` | `false` | Exit non-zero if the new snapshot has more errors or new error patterns |
 
 The comparison includes:
 
 - **Error count** — warns if errors increased
 - **Error patterns** — new patterns that appeared, old patterns that disappeared
+- **Regression gate** — `--fail-on-regression` returns a non-zero exit after printing the report if errors increased or new error patterns appeared
 - **Duration stats** — min, avg, p50, p90, max (in milliseconds), ignoring malformed values with an explicit ignored count
 - **Memory usage** — min, avg, max peak memory (in MB), ignoring malformed values with an explicit ignored count
 - **Log pattern diff** — new and gone log line patterns (UUIDs normalized)
-- **Snapshot mismatch warnings** — warns when the two files appear to be from different Lambda functions or log groups, or fails early with `--strict`
+- **Snapshot mismatch warnings** — warns when the two files appear to be from different Lambda functions or log groups; `--strict` also fails when snapshot identity fields are missing
 
 ## Snapshot Format
 

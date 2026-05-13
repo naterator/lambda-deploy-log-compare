@@ -154,6 +154,24 @@ func TestRun_CompareStrictFlag(t *testing.T) {
 	}
 }
 
+func TestRun_CompareFailOnRegressionFlag(t *testing.T) {
+	code, stdoutText, stderrText := runCLI(t, []string{
+		"compare",
+		"--fail-on-regression",
+		"--a", "testdata/compare_baseline.json",
+		"--b", "testdata/compare_new.json",
+	})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stdoutText, "*** NEW error patterns in new deployment: ***") {
+		t.Fatalf("stdout missing full compare report: %s", stdoutText)
+	}
+	if !strings.Contains(stderrText, "regression detected: 1 new error pattern(s)") {
+		t.Fatalf("stderr missing regression failure: %s", stderrText)
+	}
+}
+
 func TestRun_CaptureDuplicateFunctionsFails(t *testing.T) {
 	oldFactory := logsClientFactory
 	defer func() { logsClientFactory = oldFactory }()
@@ -172,6 +190,55 @@ func TestRun_CaptureDuplicateFunctionsFails(t *testing.T) {
 	}
 	if !strings.Contains(stderrText, `--function contains duplicate name "func-a"`) {
 		t.Fatalf("stderr missing duplicate-name validation: %s", stderrText)
+	}
+}
+
+func TestRun_CaptureMultipleFunctionsReturnsFailureCount(t *testing.T) {
+	oldFactory := logsClientFactory
+	defer func() { logsClientFactory = oldFactory }()
+
+	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+	logsClientFactory = func(region, profile string) (LogsClient, error) {
+		return &mockLogsClient{
+			describeLogStreamsFn: func(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
+				if aws.ToString(params.LogGroupName) == "/aws/lambda/fail-func" {
+					return nil, errors.New("describe failed")
+				}
+				return &cloudwatchlogs.DescribeLogStreamsOutput{
+					LogStreams: []types.LogStream{{LogStreamName: aws.String("stream-1")}},
+				}, nil
+			},
+			getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+				return singleTailPage([]types.OutputLogEvent{
+					{Message: aws.String("START RequestId: req-ok Version: $LATEST"), Timestamp: aws.Int64(ts)},
+					{Message: aws.String("REPORT RequestId: req-ok\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(ts + 100)},
+				})(ctx, params, optFns...)
+			},
+		}, nil
+	}
+
+	outDir := t.TempDir()
+	code, stdoutText, stderrText := runCLI(t, []string{
+		"capture",
+		"--function", "ok-func,fail-func",
+		"--label", "baseline",
+		"--count", "1",
+		"--out", outDir,
+	})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stdoutText, "Wrote snapshot") {
+		t.Fatalf("stdout missing successful capture: %s", stdoutText)
+	}
+	if !strings.Contains(stderrText, "Error capturing fail-func: describe-log-streams: describe failed") {
+		t.Fatalf("stderr missing function capture error: %s", stderrText)
+	}
+	if !strings.Contains(stderrText, "1 capture(s) failed") {
+		t.Fatalf("stderr missing failure count: %s", stderrText)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "ok-func_baseline.json")); err != nil {
+		t.Fatalf("expected successful function snapshot: %v", err)
 	}
 }
 

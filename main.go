@@ -39,7 +39,8 @@ func run(args []string) int {
 	compareCmd.Usage = func() { printUsage() }
 	compareFileA := compareCmd.String("a", "", "Path to first snapshot file (baseline)")
 	compareFileB := compareCmd.String("b", "", "Path to second snapshot file (new deployment)")
-	compareStrict := compareCmd.Bool("strict", false, "Fail if the snapshot function names or log groups differ")
+	compareStrict := compareCmd.Bool("strict", false, "Fail if snapshot function names or log groups are missing or differ")
+	compareFailOnRegression := compareCmd.Bool("fail-on-regression", false, "Exit non-zero if errors increase or new error patterns appear")
 
 	if len(args) < 1 {
 		printUsage()
@@ -88,7 +89,10 @@ func run(args []string) int {
 			printUsage()
 			return 1
 		}
-		if err := runCompareWithOptions(*compareFileA, *compareFileB, CompareOptions{Strict: *compareStrict}); err != nil {
+		if err := runCompareWithOptions(*compareFileA, *compareFileB, CompareOptions{
+			Strict:           *compareStrict,
+			FailOnRegression: *compareFailOnRegression,
+		}); err != nil {
 			fmt.Fprintf(stderr, "Error: %v\n", err)
 			return 1
 		}
@@ -123,7 +127,9 @@ Capture options:
 Compare options:
   --a          Path to baseline snapshot JSON file (required)
   --b          Path to new deployment snapshot JSON file (required)
-  --strict     Fail if snapshot function names or log groups differ
+  --strict     Fail if snapshot function names or log groups are missing or differ
+  --fail-on-regression
+              Fail if errors increase or new error patterns appear
 
 Log groups are derived as /aws/lambda/<function-name>.
 

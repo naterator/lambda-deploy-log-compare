@@ -135,7 +135,7 @@ func extractRequestID(line, prefix string) string {
 	if len(parts) > 0 {
 		return parts[0]
 	}
-	return after
+	return strings.TrimSpace(after)
 }
 
 func extractField(report, fieldName string) string {

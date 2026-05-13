@@ -153,8 +153,9 @@ func fetchLogEvents(ctx context.Context, client LogsClient, logGroup, streamName
 		neededInvocations = 1
 	}
 
-	var allEvents []types.OutputLogEvent
+	var eventPages [][]types.OutputLogEvent
 	var nextToken *string
+	tracker := newInvocationCompletenessTracker()
 
 	for {
 		out, err := client.GetLogEvents(ctx, &cloudwatchlogs.GetLogEventsInput{
@@ -165,7 +166,7 @@ func fetchLogEvents(ctx context.Context, client LogsClient, logGroup, streamName
 			NextToken:     nextToken,
 		})
 		if err != nil {
-			return allEvents, err
+			return flattenLogEventPages(eventPages), err
 		}
 
 		// When the backward token stops moving, the API has no older events to page in.
@@ -177,9 +178,10 @@ func fetchLogEvents(ctx context.Context, client LogsClient, logGroup, streamName
 		if len(out.Events) > 0 {
 			pageEvents := append([]types.OutputLogEvent(nil), out.Events...)
 			reverseLogEvents(pageEvents)
-			allEvents = append(pageEvents, allEvents...)
+			eventPages = append(eventPages, pageEvents)
+			tracker.addPage(pageEvents)
 
-			if len(parseInvocations(allEvents)) >= neededInvocations {
+			if tracker.count() >= neededInvocations {
 				break
 			}
 		}
@@ -189,7 +191,70 @@ func fetchLogEvents(ctx context.Context, client LogsClient, logGroup, streamName
 		}
 		nextToken = out.NextBackwardToken
 	}
-	return allEvents, nil
+	return flattenLogEventPages(eventPages), nil
+}
+
+func flattenLogEventPages(pages [][]types.OutputLogEvent) []types.OutputLogEvent {
+	total := 0
+	for _, page := range pages {
+		total += len(page)
+	}
+
+	events := make([]types.OutputLogEvent, 0, total)
+	for i := len(pages) - 1; i >= 0; i-- {
+		events = append(events, pages[i]...)
+	}
+	return events
+}
+
+type invocationCompletenessTracker struct {
+	seen map[string]struct{}
+}
+
+func newInvocationCompletenessTracker() *invocationCompletenessTracker {
+	return &invocationCompletenessTracker{seen: make(map[string]struct{})}
+}
+
+func (t *invocationCompletenessTracker) addPage(events []types.OutputLogEvent) {
+	currentReqID := ""
+
+	for _, ev := range events {
+		if ev.Message == nil || ev.Timestamp == nil {
+			continue
+		}
+		msg := strings.TrimSpace(*ev.Message)
+
+		switch {
+		case strings.HasPrefix(msg, "START RequestId: "):
+			currentReqID = extractRequestID(msg, "START RequestId: ")
+			t.mark(currentReqID)
+
+		case strings.HasPrefix(msg, "END RequestId: "):
+			currentReqID = extractRequestID(msg, "END RequestId: ")
+
+		case strings.HasPrefix(msg, "REPORT RequestId: "):
+			currentReqID = extractRequestID(msg, "REPORT RequestId: ")
+			t.mark(currentReqID)
+
+		default:
+			if reqID := extractInlineRequestID(msg); reqID != "" {
+				t.mark(reqID)
+				continue
+			}
+			t.mark(currentReqID)
+		}
+	}
+}
+
+func (t *invocationCompletenessTracker) mark(reqID string) {
+	if reqID == "" {
+		return
+	}
+	t.seen[reqID] = struct{}{}
+}
+
+func (t *invocationCompletenessTracker) count() int {
+	return len(t.seen)
 }
 
 func reverseLogEvents(events []types.OutputLogEvent) {
@@ -228,7 +293,10 @@ func sanitizeFileComponent(raw, fallback string) string {
 }
 
 func selectInvocations(allInvocations []InvocationSummary, count, offset int) []InvocationSummary {
-	sort.Slice(allInvocations, func(i, j int) bool {
+	sort.SliceStable(allInvocations, func(i, j int) bool {
+		if allInvocations[i].StartTime.Equal(allInvocations[j].StartTime) {
+			return allInvocations[i].RequestID < allInvocations[j].RequestID
+		}
 		return allInvocations[i].StartTime.After(allInvocations[j].StartTime)
 	})
 

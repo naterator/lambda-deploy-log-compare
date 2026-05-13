@@ -33,6 +33,12 @@ func TestExtractRequestID(t *testing.T) {
 			"START RequestId: ",
 			"abc-123-def",
 		},
+		{
+			"empty request id",
+			"START RequestId:    ",
+			"START RequestId: ",
+			"",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

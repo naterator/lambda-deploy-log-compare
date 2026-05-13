@@ -29,7 +29,7 @@
 
 === Duration Comparison ===
   Baseline: min=100.0ms avg=100.0ms p50=100.0ms p90=100.0ms max=100.0ms (n=1, ignored=1 malformed)
-  New     : min=110.0ms avg=115.0ms p50=120.0ms p90=120.0ms max=120.0ms (n=2, ignored=0 malformed)
+  New     : min=110.0ms avg=115.0ms p50=115.0ms p90=120.0ms max=120.0ms (n=2, ignored=0 malformed)
 
 === Memory Usage Comparison ===
   Baseline: min=80MB avg=80MB max=80MB (n=1, ignored=1 malformed)

@@ -17,7 +17,8 @@ func runCompare(fileA, fileB string) error {
 }
 
 type CompareOptions struct {
-	Strict bool
+	Strict           bool
+	FailOnRegression bool
 }
 
 func runCompareWithOptions(fileA, fileB string, opts CompareOptions) error {
@@ -31,8 +32,11 @@ func runCompareWithOptions(fileA, fileB string, opts CompareOptions) error {
 	}
 
 	warnings := comparisonWarnings(snapA, snapB)
-	if opts.Strict && len(warnings) > 0 {
-		return fmt.Errorf("strict comparison failed: %s", strings.Join(warnings, "; "))
+	if opts.Strict {
+		strictWarnings := strictComparisonWarnings(snapA, snapB)
+		if len(strictWarnings) > 0 {
+			return fmt.Errorf("strict comparison failed: %s", strings.Join(strictWarnings, "; "))
+		}
 	}
 
 	displayNamesDiffer := snapshotDisplayName(snapA) != snapshotDisplayName(snapB)
@@ -129,6 +133,13 @@ func runCompareWithOptions(fileA, fileB string, opts CompareOptions) error {
 		fmt.Fprintln(stdout, "  No significant log pattern differences detected")
 	}
 
+	if opts.FailOnRegression {
+		reasons := regressionReasons(errorsA, errorsB, newPatterns)
+		if len(reasons) > 0 {
+			return fmt.Errorf("regression detected: %s", strings.Join(reasons, "; "))
+		}
+	}
+
 	return nil
 }
 
@@ -144,7 +155,7 @@ func loadSnapshot(path string) (Snapshot, error) {
 }
 
 func printSnapshotSummary(label string, snap Snapshot) {
-	fmt.Fprintf(stdout, "--- %s: %s [%s] (log group: %s) ---\n", label, snap.FunctionName, snap.Label, snap.LogGroup)
+	fmt.Fprintf(stdout, "--- %s: %s [%s] (log group: %s) ---\n", label, snapshotDisplayName(snap), snap.Label, snap.LogGroup)
 	fmt.Fprintf(stdout, "  Invocations captured: %d\n", len(snap.Invocations))
 	fmt.Fprintf(stdout, "  Errors: %d\n", countErrors(snap))
 
@@ -233,6 +244,25 @@ func comparisonWarnings(snapA, snapB Snapshot) []string {
 	return warnings
 }
 
+func strictComparisonWarnings(snapA, snapB Snapshot) []string {
+	var warnings []string
+	warnings = append(warnings, missingSnapshotIdentityWarnings("baseline", snapA)...)
+	warnings = append(warnings, missingSnapshotIdentityWarnings("new", snapB)...)
+	warnings = append(warnings, comparisonWarnings(snapA, snapB)...)
+	return warnings
+}
+
+func missingSnapshotIdentityWarnings(label string, snap Snapshot) []string {
+	var warnings []string
+	if snap.FunctionName == "" {
+		warnings = append(warnings, fmt.Sprintf("%s snapshot missing function_name", label))
+	}
+	if snap.LogGroup == "" {
+		warnings = append(warnings, fmt.Sprintf("%s snapshot missing log_group", label))
+	}
+	return warnings
+}
+
 func countErrors(snap Snapshot) int {
 	count := 0
 	for _, inv := range snap.Invocations {
@@ -270,6 +300,17 @@ func diffPatterns(baseline, other map[string]bool) []string {
 	}
 	sort.Strings(diff)
 	return diff
+}
+
+func regressionReasons(errorsA, errorsB int, newPatterns []string) []string {
+	var reasons []string
+	if errorsB > errorsA {
+		reasons = append(reasons, fmt.Sprintf("error count increased from %d to %d", errorsA, errorsB))
+	}
+	if len(newPatterns) > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d new error pattern(s)", len(newPatterns)))
+	}
+	return reasons
 }
 
 func parseDurationMs(dur string) (float64, bool) {
@@ -324,7 +365,7 @@ func printDurationStats(label string, snap Snapshot) {
 		sum += d
 	}
 	avg := sum / float64(len(durations))
-	p50 := durations[len(durations)/2]
+	p50 := median(durations)
 	p90idx := int(float64(len(durations)) * 0.9)
 	if p90idx >= len(durations) {
 		p90idx = len(durations) - 1
@@ -332,6 +373,14 @@ func printDurationStats(label string, snap Snapshot) {
 
 	fmt.Fprintf(stdout, "  %s: min=%.1fms avg=%.1fms p50=%.1fms p90=%.1fms max=%.1fms (n=%d, ignored=%d malformed)\n",
 		label, durations[0], avg, p50, durations[p90idx], durations[len(durations)-1], len(durations), ignored)
+}
+
+func median(sorted []float64) float64 {
+	mid := len(sorted) / 2
+	if len(sorted)%2 == 1 {
+		return sorted[mid]
+	}
+	return (sorted[mid-1] + sorted[mid]) / 2
 }
 
 func printMemoryStats(label string, snap Snapshot) {

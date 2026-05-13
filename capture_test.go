@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -217,6 +218,58 @@ func TestFetchLogEvents(t *testing.T) {
 		}
 	})
 
+	t.Run("does not count split invocation pages twice", func(t *testing.T) {
+		callCount := 0
+		mock := &mockLogsClient{
+			getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+				callCount++
+				switch callCount {
+				case 1:
+					return &cloudwatchlogs.GetLogEventsOutput{
+						Events: latestFirstEvents([]types.OutputLogEvent{
+							{Message: aws.String("REPORT RequestId: req-split\tDuration: 20 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(3100)},
+						}),
+						NextBackwardToken: aws.String("token-middle"),
+					}, nil
+				case 2:
+					if params.NextToken == nil || *params.NextToken != "token-middle" {
+						t.Fatalf("NextToken = %v, want token-middle", aws.ToString(params.NextToken))
+					}
+					return &cloudwatchlogs.GetLogEventsOutput{
+						Events: latestFirstEvents([]types.OutputLogEvent{
+							{Message: aws.String("START RequestId: req-split Version: $LATEST"), Timestamp: aws.Int64(3000)},
+						}),
+						NextBackwardToken: aws.String("token-older"),
+					}, nil
+				default:
+					if params.NextToken == nil || *params.NextToken != "token-older" {
+						t.Fatalf("NextToken = %v, want token-older", aws.ToString(params.NextToken))
+					}
+					return &cloudwatchlogs.GetLogEventsOutput{
+						Events: latestFirstEvents([]types.OutputLogEvent{
+							{Message: aws.String("START RequestId: req-older Version: $LATEST"), Timestamp: aws.Int64(1000)},
+							{Message: aws.String("REPORT RequestId: req-older\tDuration: 10 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(1100)},
+						}),
+						NextBackwardToken: aws.String("token-oldest"),
+					}, nil
+				}
+			},
+		}
+
+		events, err := fetchLogEvents(context.Background(), mock, "/aws/lambda/test", "stream-1", 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if callCount != 3 {
+			t.Fatalf("expected 3 API calls, got %d", callCount)
+		}
+
+		invocations := parseInvocations(events)
+		if len(invocations) != 2 {
+			t.Fatalf("expected 2 unique invocations, got %d", len(invocations))
+		}
+	})
+
 	t.Run("stops when the backward token stops moving", func(t *testing.T) {
 		callCount := 0
 		mock := &mockLogsClient{
@@ -344,6 +397,73 @@ func TestRunCapture_NoStreams(t *testing.T) {
 	}
 }
 
+func TestRunCapture_DescribeLogStreamsError(t *testing.T) {
+	describeErr := errors.New("api unavailable")
+	mock := &mockLogsClient{
+		describeLogStreamsFn: func(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
+			return nil, describeErr
+		},
+	}
+
+	err := runCapture(mock, "test-func", "/aws/lambda/test-func", 1, 0, "test", t.TempDir())
+	if err == nil {
+		t.Fatal("expected runCapture error")
+	}
+	if !errors.Is(err, describeErr) {
+		t.Fatalf("runCapture error does not wrap describe error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "describe-log-streams: api unavailable") {
+		t.Fatalf("runCapture error = %q, want describe-log-streams context", err.Error())
+	}
+}
+
+func TestRunCapture_GetLogEventsErrorWarnsAndContinues(t *testing.T) {
+	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+	mock := &mockLogsClient{
+		describeLogStreamsFn: func(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
+			return &cloudwatchlogs.DescribeLogStreamsOutput{
+				LogStreams: []types.LogStream{
+					{LogStreamName: aws.String("stream-bad")},
+					{LogStreamName: aws.String("stream-good")},
+				},
+			}, nil
+		},
+		getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+			if aws.ToString(params.LogStreamName) == "stream-bad" {
+				return nil, errors.New("stream unavailable")
+			}
+			return singleTailPage([]types.OutputLogEvent{
+				{Message: aws.String("START RequestId: req-good Version: $LATEST"), Timestamp: aws.Int64(ts)},
+				{Message: aws.String("REPORT RequestId: req-good\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(ts + 100)},
+			})(ctx, params, optFns...)
+		},
+	}
+
+	outDir := t.TempDir()
+	var err error
+	stderrText := captureStderr(t, func() {
+		err = runCapture(mock, "test-func", "/aws/lambda/test-func", 1, 0, "test", outDir)
+	})
+	if err != nil {
+		t.Fatalf("runCapture error: %v", err)
+	}
+	if !strings.Contains(stderrText, "Warning: failed to get events from stream stream-bad: stream unavailable") {
+		t.Fatalf("stderr missing per-stream warning: %s", stderrText)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "test-func_test.json"))
+	if err != nil {
+		t.Fatalf("failed to read output file: %v", err)
+	}
+	var snap Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatalf("failed to unmarshal snapshot: %v", err)
+	}
+	if len(snap.Invocations) != 1 || snap.Invocations[0].RequestID != "req-good" {
+		t.Fatalf("captured invocations = %+v, want req-good", snap.Invocations)
+	}
+}
+
 func TestRunCapture_CreatesOutputDirectory(t *testing.T) {
 	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
 
@@ -432,6 +552,33 @@ func TestRunCapture_SelectsMostRecentInvocationsAfterOffset(t *testing.T) {
 	want := []string{"req-2", "req-1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("request IDs = %v, want %v", got, want)
+	}
+}
+
+func TestSelectInvocations_DeterministicWhenTimestampsTie(t *testing.T) {
+	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC)
+	invocations := []InvocationSummary{
+		{RequestID: "req-c", StartTime: ts},
+		{RequestID: "req-a", StartTime: ts},
+		{RequestID: "req-b", StartTime: ts},
+	}
+
+	selected := selectInvocations(invocations, 2, 1)
+	got := []string{selected[0].RequestID, selected[1].RequestID}
+	want := []string{"req-b", "req-c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("selected request IDs = %v, want %v", got, want)
+	}
+}
+
+func TestSelectInvocations_ReturnsEmptyWhenOffsetExhaustsInput(t *testing.T) {
+	invocations := []InvocationSummary{
+		{RequestID: "req-a", StartTime: time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC)},
+	}
+
+	selected := selectInvocations(invocations, 1, len(invocations))
+	if len(selected) != 0 {
+		t.Fatalf("selected invocations = %v, want none", selected)
 	}
 }
 
@@ -597,4 +744,16 @@ func singleTailPage(events []types.OutputLogEvent) func(context.Context, *cloudw
 			NextBackwardToken: aws.String("tail-1"),
 		}, nil
 	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	oldStderr := stderr
+	var buf strings.Builder
+	stderr = &buf
+	defer func() { stderr = oldStderr }()
+
+	fn()
+	return buf.String()
 }

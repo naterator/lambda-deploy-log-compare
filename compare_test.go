@@ -78,6 +78,21 @@ func TestDiffPatterns(t *testing.T) {
 	})
 }
 
+func TestRegressionReasons(t *testing.T) {
+	got := regressionReasons(1, 3, []string{"panic: boom", "fatal: nope"})
+	want := []string{
+		"error count increased from 1 to 3",
+		"2 new error pattern(s)",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("regression reasons = %v, want %v", got, want)
+	}
+
+	if got := regressionReasons(3, 1, nil); len(got) != 0 {
+		t.Fatalf("regression reasons = %v, want none", got)
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	tests := []struct {
 		input  string
@@ -177,6 +192,29 @@ func TestLoadSnapshot_SortsInvocationsNewestFirst(t *testing.T) {
 		loaded.Invocations[2].RequestID,
 	}
 	want := []string{"req-newest", "req-middle", "req-oldest"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("request IDs = %v, want %v", got, want)
+	}
+}
+
+func TestSortedInvocations_FallbackOrderingForMalformedTimestamps(t *testing.T) {
+	invocations := []InvocationRecord{
+		{RequestID: "bad-a", Timestamp: "bad-a"},
+		{RequestID: "valid-old", Timestamp: "2026-02-25T10:01:00Z"},
+		{RequestID: "empty", Timestamp: ""},
+		{RequestID: "valid-new", Timestamp: "2026-02-25T10:03:00Z"},
+		{RequestID: "bad-z", Timestamp: "bad-z"},
+	}
+
+	sorted := sortedInvocations(invocations)
+	got := []string{
+		sorted[0].RequestID,
+		sorted[1].RequestID,
+		sorted[2].RequestID,
+		sorted[3].RequestID,
+		sorted[4].RequestID,
+	}
+	want := []string{"valid-new", "valid-old", "bad-z", "bad-a", "empty"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("request IDs = %v, want %v", got, want)
 	}
@@ -292,6 +330,20 @@ func TestComparisonWarnings(t *testing.T) {
 	})
 }
 
+func TestStrictComparisonWarnings_MissingIdentity(t *testing.T) {
+	got := strictComparisonWarnings(
+		Snapshot{FunctionName: "func-a"},
+		Snapshot{LogGroup: "/aws/lambda/func-a"},
+	)
+	want := []string{
+		"baseline snapshot missing log_group",
+		"new snapshot missing function_name",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("strict warnings = %v, want %v", got, want)
+	}
+}
+
 func TestFormatInvocationSummary(t *testing.T) {
 	inv := InvocationRecord{
 		Timestamp:       "2026-02-25T12:00:00Z",
@@ -305,6 +357,20 @@ func TestFormatInvocationSummary(t *testing.T) {
 	want := "    2026-02-25T12:00:00Z  dur=120 ms  peak_mem=90 MB  mem_size=128 MB [ERROR]"
 	if got != want {
 		t.Fatalf("formatInvocationSummary() = %q, want %q", got, want)
+	}
+}
+
+func TestPrintSnapshotSummary_UsesLogGroupWhenFunctionNameMissing(t *testing.T) {
+	snap := Snapshot{
+		LogGroup: "/aws/lambda/test-func",
+		Label:    "legacy",
+	}
+
+	output := captureStdout(t, func() {
+		printSnapshotSummary("BASELINE", snap)
+	})
+	if !strings.Contains(output, "--- BASELINE: /aws/lambda/test-func [legacy]") {
+		t.Fatalf("output missing log-group display fallback: %s", output)
 	}
 }
 
@@ -509,6 +575,79 @@ func TestRunCompare_StrictMismatchFails(t *testing.T) {
 	}
 }
 
+func TestRunCompare_StrictMissingIdentityFails(t *testing.T) {
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "a.json")
+	fileB := filepath.Join(dir, "b.json")
+	writeSnapshotFile(t, fileA, Snapshot{FunctionName: "func-a", LogGroup: "/aws/lambda/func-a"})
+	writeSnapshotFile(t, fileB, Snapshot{FunctionName: "func-a"})
+
+	err := runCompareWithOptions(fileA, fileB, CompareOptions{Strict: true})
+	if err == nil {
+		t.Fatal("expected strict compare error")
+	}
+	if !strings.Contains(err.Error(), "new snapshot missing log_group") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunCompare_FailOnRegressionFailsOnErrorIncrease(t *testing.T) {
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "a.json")
+	fileB := filepath.Join(dir, "b.json")
+	writeSnapshotFile(t, fileA, Snapshot{
+		FunctionName: "func-a",
+		LogGroup:     "/aws/lambda/func-a",
+		Invocations: []InvocationRecord{
+			{RequestID: "req-a", Timestamp: "2026-02-25T10:00:00Z"},
+		},
+	})
+	writeSnapshotFile(t, fileB, Snapshot{
+		FunctionName: "func-a",
+		LogGroup:     "/aws/lambda/func-a",
+		Invocations: []InvocationRecord{
+			{RequestID: "req-b", Timestamp: "2026-02-25T10:01:00Z", IsError: true, ErrorLines: []string{"panic: boom"}, LogLines: []string{"panic: boom"}},
+		},
+	})
+
+	var err error
+	output := captureStdout(t, func() {
+		err = runCompareWithOptions(fileA, fileB, CompareOptions{FailOnRegression: true})
+	})
+	if err == nil {
+		t.Fatal("expected regression error")
+	}
+	if !strings.Contains(err.Error(), "error count increased from 0 to 1") {
+		t.Fatalf("error missing count increase: %v", err)
+	}
+	if !strings.Contains(err.Error(), "1 new error pattern(s)") {
+		t.Fatalf("error missing new pattern count: %v", err)
+	}
+	if !strings.Contains(output, "=== Log Pattern Diff ===") {
+		t.Fatalf("compare returned before printing the full report: %s", output)
+	}
+}
+
+func TestRunCompare_FailOnRegressionFailsOnNewErrorPattern(t *testing.T) {
+	var err error
+	captureStdout(t, func() {
+		err = runCompareWithOptions(
+			"testdata/compare_baseline.json",
+			"testdata/compare_new.json",
+			CompareOptions{FailOnRegression: true},
+		)
+	})
+	if err == nil {
+		t.Fatal("expected regression error")
+	}
+	if strings.Contains(err.Error(), "error count increased") {
+		t.Fatalf("error should not report an unchanged error count: %v", err)
+	}
+	if !strings.Contains(err.Error(), "1 new error pattern(s)") {
+		t.Fatalf("error missing new pattern count: %v", err)
+	}
+}
+
 func TestPrintDurationStats_IgnoresMalformedValues(t *testing.T) {
 	snap := Snapshot{
 		Invocations: []InvocationRecord{
@@ -523,6 +662,24 @@ func TestPrintDurationStats_IgnoresMalformedValues(t *testing.T) {
 	})
 	if !strings.Contains(output, "ignored=1 malformed") {
 		t.Fatalf("output missing malformed count: %s", output)
+	}
+}
+
+func TestPrintDurationStats_UsesMedianForEvenSamples(t *testing.T) {
+	snap := Snapshot{
+		Invocations: []InvocationRecord{
+			{Duration: "10 ms"},
+			{Duration: "30 ms"},
+			{Duration: "20 ms"},
+			{Duration: "40 ms"},
+		},
+	}
+
+	output := captureStdout(t, func() {
+		printDurationStats("Baseline", snap)
+	})
+	if !strings.Contains(output, "p50=25.0ms") {
+		t.Fatalf("output missing true median p50: %s", output)
 	}
 }
 
