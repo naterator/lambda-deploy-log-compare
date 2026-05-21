@@ -99,6 +99,26 @@ func TestNormalizeLogLine(t *testing.T) {
 			"  some log line  ",
 			"some log line",
 		},
+		{
+			"timestamp and duration collapsed",
+			"2026-02-25T10:00:00.123Z processed job in 123.45 ms",
+			"<TIMESTAMP> processed job in <DURATION>",
+		},
+		{
+			"ARN and numeric ID collapsed",
+			"published arn:aws:lambda:us-west-2:123456789012:function:my-func for customer_id=987654321 status=200",
+			"published <ARN> for customer_id=<NUMBER> status=200",
+		},
+		{
+			"request ID collapsed",
+			"RequestId: abc-123-def worker request failed",
+			"RequestId: <REQUEST_ID> worker request failed",
+		},
+		{
+			"JSON request ID collapsed",
+			`{"requestId":"abc-123-def","message":"failed"}`,
+			`{"requestId":"<REQUEST_ID>","message":"failed"}`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

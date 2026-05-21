@@ -33,6 +33,7 @@ func run(args []string) int {
 	captureOutDir := captureCmd.String("out", ".", "Output directory for snapshot files")
 	captureRegion := captureCmd.String("region", "us-west-2", "AWS region")
 	captureProfile := captureCmd.String("profile", "", "AWS CLI profile (optional)")
+	captureOverwrite := captureCmd.Bool("overwrite", false, "Replace an existing snapshot file with the same function and label")
 
 	compareCmd := flag.NewFlagSet("compare", flag.ContinueOnError)
 	compareCmd.SetOutput(stderr)
@@ -41,6 +42,9 @@ func run(args []string) int {
 	compareFileB := compareCmd.String("b", "", "Path to second snapshot file (new deployment)")
 	compareStrict := compareCmd.Bool("strict", false, "Fail if snapshot function names or log groups are missing or differ")
 	compareFailOnRegression := compareCmd.Bool("fail-on-regression", false, "Exit non-zero if errors increase or new error patterns appear")
+	compareOutputJSON := compareCmd.Bool("json", false, "Print a machine-readable JSON comparison summary")
+	compareMaxDurationRegression := compareCmd.Float64("max-duration-regression-pct", 0, "Exit non-zero if new p90 duration exceeds baseline p90 by more than this percent")
+	compareMaxMemoryRegression := compareCmd.Float64("max-memory-regression-pct", 0, "Exit non-zero if new max memory used exceeds baseline max by more than this percent")
 
 	if len(args) < 1 {
 		printUsage()
@@ -48,6 +52,27 @@ func run(args []string) int {
 	}
 
 	switch args[0] {
+	case "version":
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, "Error: version does not accept arguments")
+			printUsage()
+			return 1
+		}
+		fmt.Fprintln(stdout, appVersion)
+		return 0
+
+	case "selfupdate":
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, "Error: selfupdate does not accept arguments")
+			printUsage()
+			return 1
+		}
+		if err := makeReleaseUpdater().Run(context.Background(), appVersion, stdout); err != nil {
+			fmt.Fprintf(stderr, "selfupdate failed: %v\n", err)
+			return 1
+		}
+		return 0
+
 	case "capture":
 		if err := captureCmd.Parse(args[1:]); err != nil {
 			return 1
@@ -68,7 +93,9 @@ func run(args []string) int {
 		var captureErrors int
 		for _, fn := range functions {
 			logGroup := logGroupForFunction(fn)
-			err := runCapture(client, fn, logGroup, *captureCount, *captureOffset, *captureLabel, *captureOutDir)
+			err := runCaptureWithOptions(client, fn, logGroup, *captureCount, *captureOffset, *captureLabel, *captureOutDir, CaptureOptions{
+				Overwrite: *captureOverwrite,
+			})
 			if err != nil {
 				fmt.Fprintf(stderr, "Error capturing %s: %v\n", fn, err)
 				captureErrors++
@@ -90,8 +117,11 @@ func run(args []string) int {
 			return 1
 		}
 		if err := runCompareWithOptions(*compareFileA, *compareFileB, CompareOptions{
-			Strict:           *compareStrict,
-			FailOnRegression: *compareFailOnRegression,
+			Strict:                         *compareStrict,
+			FailOnRegression:               *compareFailOnRegression,
+			OutputJSON:                     *compareOutputJSON,
+			MaxDurationRegressionPercent:   *compareMaxDurationRegression,
+			MaxMemoryUsedRegressionPercent: *compareMaxMemoryRegression,
 		}); err != nil {
 			fmt.Fprintf(stderr, "Error: %v\n", err)
 			return 1
@@ -110,10 +140,15 @@ func printUsage() {
 Usage:
   lambda-deploy-log-compare capture --function <name>[,<name>,...] --label <label> [options]
   lambda-deploy-log-compare compare --a <baseline.json> --b <new.json> [options]
+  lambda-deploy-log-compare selfupdate
+  lambda-deploy-log-compare version
 
 Commands:
   capture   Capture the most recent invocation logs for one or more Lambda functions
   compare   Compare two snapshots side-by-side
+  selfupdate
+            Check GitHub releases and replace this executable if a newer release is available
+  version   Print the current version
 
 Capture options:
   --function   Unique Lambda function name(s), comma-separated (required)
@@ -123,6 +158,7 @@ Capture options:
   --out        Output directory for snapshot files (default: current dir)
   --region     AWS region (default: us-west-2)
   --profile    AWS CLI profile name (optional)
+  --overwrite  Replace an existing snapshot file with the same function and label
 
 Compare options:
   --a          Path to baseline snapshot JSON file (required)
@@ -130,6 +166,11 @@ Compare options:
   --strict     Fail if snapshot function names or log groups are missing or differ
   --fail-on-regression
               Fail if errors increase or new error patterns appear
+  --max-duration-regression-pct
+              Fail if p90 duration exceeds baseline p90 by more than this percent
+  --max-memory-regression-pct
+              Fail if max memory used exceeds baseline max by more than this percent
+  --json      Print a machine-readable JSON comparison summary
 
 Log groups are derived as /aws/lambda/<function-name>.
 

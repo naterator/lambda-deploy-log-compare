@@ -17,11 +17,76 @@ func runCompare(fileA, fileB string) error {
 }
 
 type CompareOptions struct {
-	Strict           bool
-	FailOnRegression bool
+	Strict                         bool
+	FailOnRegression               bool
+	OutputJSON                     bool
+	MaxDurationRegressionPercent   float64
+	MaxMemoryUsedRegressionPercent float64
+}
+
+type compareSummary struct {
+	Title       string              `json:"title"`
+	Baseline    snapshotFileSummary `json:"baseline"`
+	New         snapshotFileSummary `json:"new"`
+	Warnings    []string            `json:"warnings"`
+	Errors      errorComparison     `json:"errors"`
+	Duration    metricComparison    `json:"duration"`
+	Memory      metricComparison    `json:"memory"`
+	LogPatterns patternDiff         `json:"log_patterns"`
+	Regression  regressionSummary   `json:"regression"`
+}
+
+type snapshotFileSummary struct {
+	Path            string `json:"path"`
+	FunctionName    string `json:"function_name,omitempty"`
+	LogGroup        string `json:"log_group,omitempty"`
+	Label           string `json:"label,omitempty"`
+	CapturedAt      string `json:"captured_at,omitempty"`
+	InvocationCount int    `json:"invocation_count"`
+	ErrorCount      int    `json:"error_count"`
+}
+
+type errorComparison struct {
+	BaselineCount int      `json:"baseline_count"`
+	NewCount      int      `json:"new_count"`
+	NewPatterns   []string `json:"new_patterns"`
+	GonePatterns  []string `json:"gone_patterns"`
+}
+
+type metricComparison struct {
+	Baseline                  metricStats `json:"baseline"`
+	New                       metricStats `json:"new"`
+	MaxRegressionPercent      float64     `json:"max_regression_percent,omitempty"`
+	ObservedRegressionPercent float64     `json:"observed_regression_percent,omitempty"`
+}
+
+type metricStats struct {
+	HasData          bool    `json:"has_data"`
+	Count            int     `json:"count"`
+	IgnoredMalformed int     `json:"ignored_malformed"`
+	Min              float64 `json:"min"`
+	Avg              float64 `json:"avg"`
+	P50              float64 `json:"p50"`
+	P90              float64 `json:"p90"`
+	Max              float64 `json:"max"`
+}
+
+type patternDiff struct {
+	New  []string `json:"new"`
+	Gone []string `json:"gone"`
+}
+
+type regressionSummary struct {
+	Detected bool     `json:"detected"`
+	WillFail bool     `json:"will_fail"`
+	Reasons  []string `json:"reasons"`
 }
 
 func runCompareWithOptions(fileA, fileB string, opts CompareOptions) error {
+	if err := validateCompareOptions(opts); err != nil {
+		return err
+	}
+
 	snapA, err := loadSnapshot(fileA)
 	if err != nil {
 		return fmt.Errorf("load %s: %w", fileA, err)
@@ -39,15 +104,123 @@ func runCompareWithOptions(fileA, fileB string, opts CompareOptions) error {
 		}
 	}
 
+	summary := buildCompareSummary(fileA, fileB, snapA, snapB, warnings, opts)
+	if opts.OutputJSON {
+		if err := printCompareSummaryJSON(summary); err != nil {
+			return err
+		}
+		if summary.Regression.WillFail {
+			return fmt.Errorf("regression detected: %s", strings.Join(summary.Regression.Reasons, "; "))
+		}
+		return nil
+	}
+
+	printCompareSummary(summary, snapA, snapB, opts)
+	if summary.Regression.WillFail {
+		return fmt.Errorf("regression detected: %s", strings.Join(summary.Regression.Reasons, "; "))
+	}
+
+	return nil
+}
+
+func validateCompareOptions(opts CompareOptions) error {
+	if opts.MaxDurationRegressionPercent < 0 {
+		return fmt.Errorf("--max-duration-regression-pct must be greater than or equal to 0")
+	}
+	if opts.MaxMemoryUsedRegressionPercent < 0 {
+		return fmt.Errorf("--max-memory-regression-pct must be greater than or equal to 0")
+	}
+	return nil
+}
+
+func buildCompareSummary(fileA, fileB string, snapA, snapB Snapshot, warnings []string, opts CompareOptions) compareSummary {
+	errorsA := countErrors(snapA)
+	errorsB := countErrors(snapB)
+	patternsA := errorPatterns(snapA)
+	patternsB := errorPatterns(snapB)
+	newPatterns := diffPatterns(patternsA, patternsB)
+	gonePatterns := diffPatterns(patternsB, patternsA)
+	logPatsA := logPatterns(snapA)
+	logPatsB := logPatterns(snapB)
+	newLogPats := diffPatterns(logPatsA, logPatsB)
+	goneLogPats := diffPatterns(logPatsB, logPatsA)
+
+	durationComparison := metricComparison{
+		Baseline:             durationStats(snapA),
+		New:                  durationStats(snapB),
+		MaxRegressionPercent: opts.MaxDurationRegressionPercent,
+	}
+	durationComparison.ObservedRegressionPercent = percentIncrease(durationComparison.Baseline.P90, durationComparison.New.P90)
+
+	memoryComparison := metricComparison{
+		Baseline:             memoryStats(snapA),
+		New:                  memoryStats(snapB),
+		MaxRegressionPercent: opts.MaxMemoryUsedRegressionPercent,
+	}
+	memoryComparison.ObservedRegressionPercent = percentIncrease(memoryComparison.Baseline.Max, memoryComparison.New.Max)
+
+	basicReasons := regressionReasons(errorsA, errorsB, newPatterns)
+	gateReasons := metricRegressionReasons(durationComparison, memoryComparison, opts)
+	allReasons := append(append([]string(nil), basicReasons...), gateReasons...)
+
+	return compareSummary{
+		Title: comparisonTitle(snapA, snapB),
+		Baseline: snapshotFileSummary{
+			Path:            fileA,
+			FunctionName:    snapA.FunctionName,
+			LogGroup:        snapA.LogGroup,
+			Label:           snapA.Label,
+			CapturedAt:      snapA.CapturedAt,
+			InvocationCount: len(snapA.Invocations),
+			ErrorCount:      errorsA,
+		},
+		New: snapshotFileSummary{
+			Path:            fileB,
+			FunctionName:    snapB.FunctionName,
+			LogGroup:        snapB.LogGroup,
+			Label:           snapB.Label,
+			CapturedAt:      snapB.CapturedAt,
+			InvocationCount: len(snapB.Invocations),
+			ErrorCount:      errorsB,
+		},
+		Warnings: warnings,
+		Errors: errorComparison{
+			BaselineCount: errorsA,
+			NewCount:      errorsB,
+			NewPatterns:   newPatterns,
+			GonePatterns:  gonePatterns,
+		},
+		Duration: durationComparison,
+		Memory:   memoryComparison,
+		LogPatterns: patternDiff{
+			New:  newLogPats,
+			Gone: goneLogPats,
+		},
+		Regression: regressionSummary{
+			Detected: len(allReasons) > 0,
+			WillFail: (opts.FailOnRegression && len(basicReasons) > 0) ||
+				len(gateReasons) > 0,
+			Reasons: allReasons,
+		},
+	}
+}
+
+func printCompareSummaryJSON(summary compareSummary) error {
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(summary)
+}
+
+func printCompareSummary(summary compareSummary, snapA, snapB Snapshot, opts CompareOptions) {
 	displayNamesDiffer := snapshotDisplayName(snapA) != snapshotDisplayName(snapB)
-	fmt.Fprintf(stdout, "=== Comparison: %s ===\n", comparisonTitle(snapA, snapB))
-	printSnapshotSource("Baseline", fileA, snapA, displayNamesDiffer)
-	printSnapshotSource("New", fileB, snapB, displayNamesDiffer)
+	fmt.Fprintf(stdout, "=== Comparison: %s ===\n", summary.Title)
+	printSnapshotSource("Baseline", summary.Baseline.Path, snapA, displayNamesDiffer)
+	printSnapshotSource("New", summary.New.Path, snapB, displayNamesDiffer)
 	fmt.Fprintln(stdout)
-	for _, warning := range warnings {
+	for _, warning := range summary.Warnings {
 		fmt.Fprintf(stdout, "  WARNING: %s\n", warning)
 	}
-	if len(warnings) > 0 {
+	if len(summary.Warnings) > 0 {
 		fmt.Fprintln(stdout)
 	}
 
@@ -58,33 +231,26 @@ func runCompareWithOptions(fileA, fileB string, opts CompareOptions) error {
 
 	// Error comparison
 	fmt.Fprintln(stdout, "=== Error Comparison ===")
-	errorsA := countErrors(snapA)
-	errorsB := countErrors(snapB)
-	fmt.Fprintf(stdout, "  Baseline errors: %d / %d invocations\n", errorsA, len(snapA.Invocations))
-	fmt.Fprintf(stdout, "  New errors:      %d / %d invocations\n", errorsB, len(snapB.Invocations))
+	fmt.Fprintf(stdout, "  Baseline errors: %d / %d invocations\n", summary.Errors.BaselineCount, summary.Baseline.InvocationCount)
+	fmt.Fprintf(stdout, "  New errors:      %d / %d invocations\n", summary.Errors.NewCount, summary.New.InvocationCount)
 
-	if errorsB > errorsA {
+	if summary.Errors.NewCount > summary.Errors.BaselineCount {
 		fmt.Fprintln(stdout, "  *** WARNING: Error count increased! ***")
-	} else if errorsB < errorsA {
+	} else if summary.Errors.NewCount < summary.Errors.BaselineCount {
 		fmt.Fprintln(stdout, "  Error count decreased (good)")
 	} else {
 		fmt.Fprintln(stdout, "  Error count unchanged")
 	}
 
-	patternsA := errorPatterns(snapA)
-	patternsB := errorPatterns(snapB)
-
-	newPatterns := diffPatterns(patternsA, patternsB)
-	if len(newPatterns) > 0 {
+	if len(summary.Errors.NewPatterns) > 0 {
 		fmt.Fprintln(stdout, "\n  *** NEW error patterns in new deployment: ***")
-		for _, p := range newPatterns {
+		for _, p := range summary.Errors.NewPatterns {
 			fmt.Fprintf(stdout, "    - %s\n", p)
 		}
 	}
-	gonePatterns := diffPatterns(patternsB, patternsA)
-	if len(gonePatterns) > 0 {
+	if len(summary.Errors.GonePatterns) > 0 {
 		fmt.Fprintln(stdout, "\n  Error patterns no longer appearing:")
-		for _, p := range gonePatterns {
+		for _, p := range summary.Errors.GonePatterns {
 			fmt.Fprintf(stdout, "    - %s\n", p)
 		}
 	}
@@ -99,48 +265,46 @@ func runCompareWithOptions(fileA, fileB string, opts CompareOptions) error {
 	printMemoryStats("Baseline", snapA)
 	printMemoryStats("New     ", snapB)
 
+	if opts.MaxDurationRegressionPercent > 0 || opts.MaxMemoryUsedRegressionPercent > 0 {
+		fmt.Fprintln(stdout, "\n=== Regression Gates ===")
+		gateReasons := metricRegressionReasons(summary.Duration, summary.Memory, opts)
+		if len(gateReasons) == 0 {
+			fmt.Fprintln(stdout, "  No configured duration or memory regression gates exceeded")
+		} else {
+			for _, reason := range gateReasons {
+				fmt.Fprintf(stdout, "  *** WARNING: %s ***\n", reason)
+			}
+		}
+	}
+
 	// Log pattern diff
 	fmt.Fprintln(stdout, "\n=== Log Pattern Diff ===")
-	logPatsA := logPatterns(snapA)
-	logPatsB := logPatterns(snapB)
 
-	newLogPats := diffPatterns(logPatsA, logPatsB)
-	goneLogPats := diffPatterns(logPatsB, logPatsA)
-
-	if len(newLogPats) > 0 {
+	if len(summary.LogPatterns.New) > 0 {
 		fmt.Fprintln(stdout, "  New log patterns (only in new deployment):")
 		limit := maxPatternDisplay
-		for i, p := range newLogPats {
+		for i, p := range summary.LogPatterns.New {
 			if i >= limit {
-				fmt.Fprintf(stdout, "    ... and %d more\n", len(newLogPats)-limit)
+				fmt.Fprintf(stdout, "    ... and %d more\n", len(summary.LogPatterns.New)-limit)
 				break
 			}
 			fmt.Fprintf(stdout, "    + %s\n", truncate(p, 120))
 		}
 	}
-	if len(goneLogPats) > 0 {
+	if len(summary.LogPatterns.Gone) > 0 {
 		fmt.Fprintln(stdout, "  Gone log patterns (only in baseline):")
 		limit := maxPatternDisplay
-		for i, p := range goneLogPats {
+		for i, p := range summary.LogPatterns.Gone {
 			if i >= limit {
-				fmt.Fprintf(stdout, "    ... and %d more\n", len(goneLogPats)-limit)
+				fmt.Fprintf(stdout, "    ... and %d more\n", len(summary.LogPatterns.Gone)-limit)
 				break
 			}
 			fmt.Fprintf(stdout, "    - %s\n", truncate(p, 120))
 		}
 	}
-	if len(newLogPats) == 0 && len(goneLogPats) == 0 {
+	if len(summary.LogPatterns.New) == 0 && len(summary.LogPatterns.Gone) == 0 {
 		fmt.Fprintln(stdout, "  No significant log pattern differences detected")
 	}
-
-	if opts.FailOnRegression {
-		reasons := regressionReasons(errorsA, errorsB, newPatterns)
-		if len(reasons) > 0 {
-			return fmt.Errorf("regression detected: %s", strings.Join(reasons, "; "))
-		}
-	}
-
-	return nil
 }
 
 func loadSnapshot(path string) (Snapshot, error) {
@@ -149,9 +313,40 @@ func loadSnapshot(path string) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	var snap Snapshot
-	err = json.Unmarshal(data, &snap)
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return Snapshot{}, err
+	}
+	if err := validateLoadedSnapshot(snap); err != nil {
+		return Snapshot{}, err
+	}
 	snap.Invocations = sortedInvocations(snap.Invocations)
-	return snap, err
+	return snap, nil
+}
+
+func validateLoadedSnapshot(snap Snapshot) error {
+	if snap.FunctionName != "" || snap.LogGroup != "" || snap.CapturedAt != "" || snap.Label != "" {
+		return nil
+	}
+
+	for _, inv := range snap.Invocations {
+		if invocationHasSnapshotData(inv) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("invalid snapshot: missing snapshot metadata and invocation records")
+}
+
+func invocationHasSnapshotData(inv InvocationRecord) bool {
+	return inv.RequestID != "" ||
+		inv.Timestamp != "" ||
+		inv.Duration != "" ||
+		inv.BilledMs != "" ||
+		inv.MemorySizeMB != "" ||
+		inv.MaxMemoryUsedMB != "" ||
+		inv.IsError ||
+		len(inv.ErrorLines) > 0 ||
+		len(inv.LogLines) > 0
 }
 
 func printSnapshotSummary(label string, snap Snapshot) {
@@ -313,6 +508,32 @@ func regressionReasons(errorsA, errorsB int, newPatterns []string) []string {
 	return reasons
 }
 
+func metricRegressionReasons(duration, memory metricComparison, opts CompareOptions) []string {
+	var reasons []string
+	if opts.MaxDurationRegressionPercent > 0 &&
+		duration.Baseline.HasData &&
+		duration.New.HasData &&
+		duration.ObservedRegressionPercent > opts.MaxDurationRegressionPercent {
+		reasons = append(reasons, fmt.Sprintf("p90 duration increased by %.1f%% (%.1fms to %.1fms), over %.1f%% limit",
+			duration.ObservedRegressionPercent, duration.Baseline.P90, duration.New.P90, opts.MaxDurationRegressionPercent))
+	}
+	if opts.MaxMemoryUsedRegressionPercent > 0 &&
+		memory.Baseline.HasData &&
+		memory.New.HasData &&
+		memory.ObservedRegressionPercent > opts.MaxMemoryUsedRegressionPercent {
+		reasons = append(reasons, fmt.Sprintf("max memory used increased by %.1f%% (%.0fMB to %.0fMB), over %.1f%% limit",
+			memory.ObservedRegressionPercent, memory.Baseline.Max, memory.New.Max, opts.MaxMemoryUsedRegressionPercent))
+	}
+	return reasons
+}
+
+func percentIncrease(baseline, newValue float64) float64 {
+	if baseline <= 0 || newValue <= baseline {
+		return 0
+	}
+	return ((newValue - baseline) / baseline) * 100
+}
+
 func parseDurationMs(dur string) (float64, bool) {
 	return parseNumberWithSuffixes(dur, " ms", "ms")
 }
@@ -338,6 +559,21 @@ func parseNumberWithSuffixes(value string, suffixes ...string) (float64, bool) {
 }
 
 func printDurationStats(label string, snap Snapshot) {
+	stats := durationStats(snap)
+	if !stats.HasData {
+		if stats.IgnoredMalformed > 0 {
+			fmt.Fprintf(stdout, "  %s: no duration data (ignored=%d malformed)\n", label, stats.IgnoredMalformed)
+			return
+		}
+		fmt.Fprintf(stdout, "  %s: no duration data\n", label)
+		return
+	}
+
+	fmt.Fprintf(stdout, "  %s: min=%.1fms avg=%.1fms p50=%.1fms p90=%.1fms max=%.1fms (n=%d, ignored=%d malformed)\n",
+		label, stats.Min, stats.Avg, stats.P50, stats.P90, stats.Max, stats.Count, stats.IgnoredMalformed)
+}
+
+func durationStats(snap Snapshot) metricStats {
 	var durations []float64
 	ignored := 0
 	for _, inv := range snap.Invocations {
@@ -351,28 +587,7 @@ func printDurationStats(label string, snap Snapshot) {
 		}
 		durations = append(durations, duration)
 	}
-	if len(durations) == 0 {
-		if ignored > 0 {
-			fmt.Fprintf(stdout, "  %s: no duration data (ignored=%d malformed)\n", label, ignored)
-			return
-		}
-		fmt.Fprintf(stdout, "  %s: no duration data\n", label)
-		return
-	}
-	sort.Float64s(durations)
-	sum := 0.0
-	for _, d := range durations {
-		sum += d
-	}
-	avg := sum / float64(len(durations))
-	p50 := median(durations)
-	p90idx := int(float64(len(durations)) * 0.9)
-	if p90idx >= len(durations) {
-		p90idx = len(durations) - 1
-	}
-
-	fmt.Fprintf(stdout, "  %s: min=%.1fms avg=%.1fms p50=%.1fms p90=%.1fms max=%.1fms (n=%d, ignored=%d malformed)\n",
-		label, durations[0], avg, p50, durations[p90idx], durations[len(durations)-1], len(durations), ignored)
+	return computeMetricStats(durations, ignored)
 }
 
 func median(sorted []float64) float64 {
@@ -384,6 +599,21 @@ func median(sorted []float64) float64 {
 }
 
 func printMemoryStats(label string, snap Snapshot) {
+	stats := memoryStats(snap)
+	if !stats.HasData {
+		if stats.IgnoredMalformed > 0 {
+			fmt.Fprintf(stdout, "  %s: no memory data (ignored=%d malformed)\n", label, stats.IgnoredMalformed)
+			return
+		}
+		fmt.Fprintf(stdout, "  %s: no memory data\n", label)
+		return
+	}
+
+	fmt.Fprintf(stdout, "  %s: min=%.0fMB avg=%.0fMB max=%.0fMB (n=%d, ignored=%d malformed)\n",
+		label, stats.Min, stats.Avg, stats.Max, stats.Count, stats.IgnoredMalformed)
+}
+
+func memoryStats(snap Snapshot) metricStats {
 	var mems []float64
 	ignored := 0
 	for _, inv := range snap.Invocations {
@@ -397,21 +627,33 @@ func printMemoryStats(label string, snap Snapshot) {
 		}
 		mems = append(mems, mem)
 	}
-	if len(mems) == 0 {
-		if ignored > 0 {
-			fmt.Fprintf(stdout, "  %s: no memory data (ignored=%d malformed)\n", label, ignored)
-			return
-		}
-		fmt.Fprintf(stdout, "  %s: no memory data\n", label)
-		return
+	return computeMetricStats(mems, ignored)
+}
+
+func computeMetricStats(values []float64, ignored int) metricStats {
+	if len(values) == 0 {
+		return metricStats{IgnoredMalformed: ignored}
 	}
-	sort.Float64s(mems)
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
 	sum := 0.0
-	for _, m := range mems {
-		sum += m
+	for _, value := range sorted {
+		sum += value
 	}
-	fmt.Fprintf(stdout, "  %s: min=%.0fMB avg=%.0fMB max=%.0fMB (n=%d, ignored=%d malformed)\n",
-		label, mems[0], sum/float64(len(mems)), mems[len(mems)-1], len(mems), ignored)
+	p90idx := int(float64(len(sorted)) * 0.9)
+	if p90idx >= len(sorted) {
+		p90idx = len(sorted) - 1
+	}
+	return metricStats{
+		HasData:          true,
+		Count:            len(sorted),
+		IgnoredMalformed: ignored,
+		Min:              sorted[0],
+		Avg:              sum / float64(len(sorted)),
+		P50:              median(sorted),
+		P90:              sorted[p90idx],
+		Max:              sorted[len(sorted)-1],
+	}
 }
 
 func truncate(s string, maxLen int) string {

@@ -270,6 +270,57 @@ func TestFetchLogEvents(t *testing.T) {
 		}
 	})
 
+	t.Run("continues until newest split invocation has start boundary", func(t *testing.T) {
+		callCount := 0
+		mock := &mockLogsClient{
+			getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+				callCount++
+				switch callCount {
+				case 1:
+					return &cloudwatchlogs.GetLogEventsOutput{
+						Events: latestFirstEvents([]types.OutputLogEvent{
+							{Message: aws.String("REPORT RequestId: req-split\tDuration: 20 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(3100)},
+						}),
+						NextBackwardToken: aws.String("token-start"),
+					}, nil
+				case 2:
+					if params.NextToken == nil || *params.NextToken != "token-start" {
+						t.Fatalf("NextToken = %v, want token-start", aws.ToString(params.NextToken))
+					}
+					return &cloudwatchlogs.GetLogEventsOutput{
+						Events: latestFirstEvents([]types.OutputLogEvent{
+							{Message: aws.String("START RequestId: req-split Version: $LATEST"), Timestamp: aws.Int64(3000)},
+							{Message: aws.String("panic: lost work before report"), Timestamp: aws.Int64(3050)},
+						}),
+						NextBackwardToken: aws.String("token-older"),
+					}, nil
+				default:
+					t.Fatalf("unexpected GetLogEvents call %d", callCount)
+					return nil, nil
+				}
+			},
+		}
+
+		events, err := fetchLogEvents(context.Background(), mock, "/aws/lambda/test", "stream-1", 1)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if callCount != 2 {
+			t.Fatalf("expected 2 API calls, got %d", callCount)
+		}
+
+		invocations := parseInvocations(events)
+		if len(invocations) != 1 {
+			t.Fatalf("expected 1 invocation, got %d", len(invocations))
+		}
+		if invocations[0].StartTime.UnixMilli() != 3000 {
+			t.Fatalf("StartTime = %d, want 3000", invocations[0].StartTime.UnixMilli())
+		}
+		if !invocations[0].IsError || len(invocations[0].ErrorLines) != 1 {
+			t.Fatalf("expected split-page error line to be preserved: %+v", invocations[0])
+		}
+	})
+
 	t.Run("stops when the backward token stops moving", func(t *testing.T) {
 		callCount := 0
 		mock := &mockLogsClient{
@@ -316,6 +367,36 @@ func TestFetchLogEvents(t *testing.T) {
 		_, err := fetchLogEvents(context.Background(), mock, "/aws/lambda/test", "stream-1", 1)
 		if err == nil {
 			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("returns partial events with later page error", func(t *testing.T) {
+		callCount := 0
+		mock := &mockLogsClient{
+			getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+				callCount++
+				if params.NextToken != nil {
+					return nil, errors.New("api error")
+				}
+				return &cloudwatchlogs.GetLogEventsOutput{
+					Events: latestFirstEvents([]types.OutputLogEvent{
+						{Message: aws.String("START RequestId: req-1 Version: $LATEST"), Timestamp: aws.Int64(1000)},
+						{Message: aws.String("REPORT RequestId: req-1\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(1100)},
+					}),
+					NextBackwardToken: aws.String("token-older"),
+				}, nil
+			},
+		}
+
+		events, err := fetchLogEvents(context.Background(), mock, "/aws/lambda/test", "stream-1", 2)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if callCount != 2 {
+			t.Fatalf("GetLogEvents calls = %d, want 2", callCount)
+		}
+		if len(events) != 2 {
+			t.Fatalf("partial events = %d, want 2", len(events))
 		}
 	})
 }
@@ -372,6 +453,61 @@ func TestRunCapture(t *testing.T) {
 	}
 	if snap.Invocations[0].Duration != "50 ms" {
 		t.Errorf("Duration = %q, want %q", snap.Invocations[0].Duration, "50 ms")
+	}
+}
+
+func TestRunCapture_DoesNotOverwriteExistingSnapshot(t *testing.T) {
+	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+	outDir := t.TempDir()
+	outPath := filepath.Join(outDir, "test-func_baseline.json")
+
+	if err := runCapture(newSingleInvocationCaptureClient(ts, "req-original"), "test-func", "/aws/lambda/test-func", 1, 0, "baseline", outDir); err != nil {
+		t.Fatalf("initial runCapture error: %v", err)
+	}
+	originalData, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("failed to read original snapshot: %v", err)
+	}
+
+	err = runCapture(newSingleInvocationCaptureClient(ts+10_000, "req-new"), "test-func", "/aws/lambda/test-func", 1, 0, "baseline", outDir)
+	if err == nil {
+		t.Fatal("runCapture returned nil, want existing-file error")
+	}
+	if !strings.Contains(err.Error(), "snapshot already exists") || !strings.Contains(err.Error(), "--overwrite") {
+		t.Fatalf("runCapture error = %q, want overwrite guidance", err.Error())
+	}
+
+	currentData, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("failed to read current snapshot: %v", err)
+	}
+	if string(currentData) != string(originalData) {
+		t.Fatalf("snapshot was overwritten despite missing overwrite option")
+	}
+}
+
+func TestRunCapture_OverwriteExistingSnapshotWhenRequested(t *testing.T) {
+	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+	outDir := t.TempDir()
+	outPath := filepath.Join(outDir, "test-func_baseline.json")
+
+	if err := runCapture(newSingleInvocationCaptureClient(ts, "req-original"), "test-func", "/aws/lambda/test-func", 1, 0, "baseline", outDir); err != nil {
+		t.Fatalf("initial runCapture error: %v", err)
+	}
+	if err := runCaptureWithOptions(newSingleInvocationCaptureClient(ts+10_000, "req-new"), "test-func", "/aws/lambda/test-func", 1, 0, "baseline", outDir, CaptureOptions{Overwrite: true}); err != nil {
+		t.Fatalf("overwrite runCapture error: %v", err)
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("failed to read overwritten snapshot: %v", err)
+	}
+	var snap Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatalf("failed to unmarshal snapshot: %v", err)
+	}
+	if len(snap.Invocations) != 1 || snap.Invocations[0].RequestID != "req-new" {
+		t.Fatalf("captured invocations = %+v, want overwritten req-new snapshot", snap.Invocations)
 	}
 }
 
@@ -461,6 +597,58 @@ func TestRunCapture_GetLogEventsErrorWarnsAndContinues(t *testing.T) {
 	}
 	if len(snap.Invocations) != 1 || snap.Invocations[0].RequestID != "req-good" {
 		t.Fatalf("captured invocations = %+v, want req-good", snap.Invocations)
+	}
+}
+
+func TestRunCapture_UsesPartialEventsWhenGetLogEventsFailsAfterPages(t *testing.T) {
+	ts := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+	callCount := 0
+	mock := &mockLogsClient{
+		describeLogStreamsFn: func(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
+			return &cloudwatchlogs.DescribeLogStreamsOutput{
+				LogStreams: []types.LogStream{{LogStreamName: aws.String("stream-partial")}},
+			}, nil
+		},
+		getLogEventsFn: func(ctx context.Context, params *cloudwatchlogs.GetLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+			callCount++
+			if params.NextToken != nil {
+				return nil, errors.New("next page unavailable")
+			}
+			return &cloudwatchlogs.GetLogEventsOutput{
+				Events: latestFirstEvents([]types.OutputLogEvent{
+					{Message: aws.String("START RequestId: req-partial Version: $LATEST"), Timestamp: aws.Int64(ts)},
+					{Message: aws.String("REPORT RequestId: req-partial\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(ts + 100)},
+				}),
+				NextBackwardToken: aws.String("token-older"),
+			}, nil
+		},
+	}
+
+	outDir := t.TempDir()
+	var err error
+	stderrText := captureStderr(t, func() {
+		err = runCapture(mock, "test-func", "/aws/lambda/test-func", 2, 0, "partial", outDir)
+	})
+	if err != nil {
+		t.Fatalf("runCapture error: %v", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("GetLogEvents calls = %d, want 2", callCount)
+	}
+	if !strings.Contains(stderrText, "Warning: failed to get complete events from stream stream-partial: next page unavailable; using 2 event(s) fetched before the failure") {
+		t.Fatalf("stderr missing partial-use warning: %s", stderrText)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "test-func_partial.json"))
+	if err != nil {
+		t.Fatalf("failed to read output file: %v", err)
+	}
+	var snap Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatalf("failed to unmarshal snapshot: %v", err)
+	}
+	if len(snap.Invocations) != 1 || snap.Invocations[0].RequestID != "req-partial" {
+		t.Fatalf("captured invocations = %+v, want partial invocation", snap.Invocations)
 	}
 }
 
@@ -732,6 +920,20 @@ func latestFirstEvents(events []types.OutputLogEvent) []types.OutputLogEvent {
 	page := append([]types.OutputLogEvent(nil), events...)
 	reverseLogEvents(page)
 	return page
+}
+
+func newSingleInvocationCaptureClient(ts int64, requestID string) *mockLogsClient {
+	return &mockLogsClient{
+		describeLogStreamsFn: func(ctx context.Context, params *cloudwatchlogs.DescribeLogStreamsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
+			return &cloudwatchlogs.DescribeLogStreamsOutput{
+				LogStreams: []types.LogStream{{LogStreamName: aws.String("stream-1")}},
+			}, nil
+		},
+		getLogEventsFn: singleTailPage([]types.OutputLogEvent{
+			{Message: aws.String("START RequestId: " + requestID + " Version: $LATEST"), Timestamp: aws.Int64(ts)},
+			{Message: aws.String("REPORT RequestId: " + requestID + "\tDuration: 50 ms\tBilled Duration: 100 ms\tMemory Size: 128 MB\tMax Memory Used: 64 MB"), Timestamp: aws.Int64(ts + 100)},
+		}),
+	}
 }
 
 func singleTailPage(events []types.OutputLogEvent) func(context.Context, *cloudwatchlogs.GetLogEventsInput, ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {

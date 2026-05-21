@@ -1,10 +1,20 @@
 package main
 
 import (
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
+)
+
+var (
+	requestIDPattern   = regexp.MustCompile(`(?i)\b(request[_-]?id|requestid)\b([":'\s]*[:=]\s*["']?)[A-Za-z0-9._:/+=-]+`)
+	arnPattern         = regexp.MustCompile(`arn:aws[a-zA-Z-]*:[^\s,;\]\)"]+`)
+	rfc3339TimePattern = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}[T ][0-9:.]+(?:Z|[+-]\d{2}:?\d{2})?\b`)
+	slashTimePattern   = regexp.MustCompile(`\b\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\b`)
+	durationPattern    = regexp.MustCompile(`\b\d+(?:\.\d+)?\s*(?:ms|msec|s|sec|secs|seconds)\b`)
+	longNumberPattern  = regexp.MustCompile(`\b\d{6,}\b`)
 )
 
 func parseInvocations(events []types.OutputLogEvent) []InvocationSummary {
@@ -223,7 +233,14 @@ func isBenignErrorLine(lower string) bool {
 }
 
 func normalizeLogLine(line string) string {
-	result := collapseHexRuns(line, 32, "<UUID>")
+	result := strings.TrimSpace(line)
+	result = requestIDPattern.ReplaceAllString(result, `${1}${2}<REQUEST_ID>`)
+	result = arnPattern.ReplaceAllString(result, "<ARN>")
+	result = rfc3339TimePattern.ReplaceAllString(result, "<TIMESTAMP>")
+	result = slashTimePattern.ReplaceAllString(result, "<TIMESTAMP>")
+	result = durationPattern.ReplaceAllString(result, "<DURATION>")
+	result = collapseHexRuns(result, 32, "<UUID>")
+	result = longNumberPattern.ReplaceAllString(result, "<NUMBER>")
 	if len(result) > 100 {
 		result = result[:100]
 	}

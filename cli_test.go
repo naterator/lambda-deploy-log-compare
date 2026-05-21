@@ -137,6 +137,50 @@ func TestRun_CaptureAndCompareEndToEnd(t *testing.T) {
 	}
 }
 
+func TestRun_CaptureOverwriteFlagAllowsExistingSnapshot(t *testing.T) {
+	base := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC).UnixMilli()
+	oldFactory := logsClientFactory
+	defer func() { logsClientFactory = oldFactory }()
+
+	factoryCalls := 0
+	logsClientFactory = func(region, profile string) (LogsClient, error) {
+		factoryCalls++
+		switch factoryCalls {
+		case 1:
+			return newCLIClient(base, "req-original", []string{"original log"}, false), nil
+		case 2:
+			return newCLIClient(base+10_000, "req-new", []string{"new log"}, false), nil
+		default:
+			t.Fatalf("unexpected logsClientFactory call %d", factoryCalls)
+			return nil, nil
+		}
+	}
+
+	outDir := t.TempDir()
+	args := []string{"capture", "--function", "test-func", "--label", "baseline", "--count", "1", "--out", outDir}
+	code, _, stderrText := runCLI(t, args)
+	if code != 0 {
+		t.Fatalf("initial capture exit code = %d, stderr = %s", code, stderrText)
+	}
+
+	code, _, stderrText = runCLI(t, append(args, "--overwrite"))
+	if code != 0 {
+		t.Fatalf("overwrite capture exit code = %d, stderr = %s", code, stderrText)
+	}
+
+	var snap Snapshot
+	data, err := os.ReadFile(filepath.Join(outDir, "test-func_baseline.json"))
+	if err != nil {
+		t.Fatalf("failed to read snapshot: %v", err)
+	}
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatalf("failed to unmarshal snapshot: %v", err)
+	}
+	if len(snap.Invocations) != 1 || snap.Invocations[0].RequestID != "req-new" {
+		t.Fatalf("captured invocations = %+v, want overwritten req-new snapshot", snap.Invocations)
+	}
+}
+
 func TestRun_CompareStrictFlag(t *testing.T) {
 	dir := t.TempDir()
 	writeSnapshotFile(t, filepath.Join(dir, "a.json"), Snapshot{FunctionName: "func-a", LogGroup: "/aws/lambda/func-a"})
@@ -169,6 +213,65 @@ func TestRun_CompareFailOnRegressionFlag(t *testing.T) {
 	}
 	if !strings.Contains(stderrText, "regression detected: 1 new error pattern(s)") {
 		t.Fatalf("stderr missing regression failure: %s", stderrText)
+	}
+}
+
+func TestRun_CompareJSONFlag(t *testing.T) {
+	code, stdoutText, stderrText := runCLI(t, []string{
+		"compare",
+		"--json",
+		"--a", "testdata/compare_baseline.json",
+		"--b", "testdata/compare_new.json",
+	})
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", code, stderrText)
+	}
+	if stderrText != "" {
+		t.Fatalf("stderr = %q, want empty", stderrText)
+	}
+
+	var summary compareSummary
+	if err := json.Unmarshal([]byte(stdoutText), &summary); err != nil {
+		t.Fatalf("stdout is not valid compare summary JSON: %v\n%s", err, stdoutText)
+	}
+	if summary.Title != "test-func" {
+		t.Fatalf("summary title = %q, want test-func", summary.Title)
+	}
+}
+
+func TestRun_CompareConfiguredRegressionGateFlag(t *testing.T) {
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "a.json")
+	fileB := filepath.Join(dir, "b.json")
+	writeSnapshotFile(t, fileA, Snapshot{
+		FunctionName: "func-a",
+		LogGroup:     "/aws/lambda/func-a",
+		Invocations: []InvocationRecord{
+			{RequestID: "req-a", Timestamp: "2026-02-25T10:00:00Z", Duration: "100 ms"},
+		},
+	})
+	writeSnapshotFile(t, fileB, Snapshot{
+		FunctionName: "func-a",
+		LogGroup:     "/aws/lambda/func-a",
+		Invocations: []InvocationRecord{
+			{RequestID: "req-b", Timestamp: "2026-02-25T10:01:00Z", Duration: "150 ms"},
+		},
+	})
+
+	code, stdoutText, stderrText := runCLI(t, []string{
+		"compare",
+		"--max-duration-regression-pct", "20",
+		"--a", fileA,
+		"--b", fileB,
+	})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stdoutText, "=== Regression Gates ===") {
+		t.Fatalf("stdout missing regression gate section: %s", stdoutText)
+	}
+	if !strings.Contains(stderrText, "p90 duration increased by 50.0%") {
+		t.Fatalf("stderr missing duration regression reason: %s", stderrText)
 	}
 }
 

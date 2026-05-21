@@ -238,6 +238,45 @@ func TestLoadSnapshot_MalformedJSON(t *testing.T) {
 	}
 }
 
+func TestLoadSnapshot_EmptyObjectRejected(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "empty.json")
+	if err := os.WriteFile(tmpFile, []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadSnapshot(tmpFile)
+	if err == nil {
+		t.Fatal("expected invalid snapshot error")
+	}
+	if !strings.Contains(err.Error(), "invalid snapshot: missing snapshot metadata and invocation records") {
+		t.Fatalf("loadSnapshot error = %q, want invalid snapshot message", err.Error())
+	}
+}
+
+func TestLoadSnapshot_AllowsLegacyInvocationOnlySnapshot(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "legacy.json")
+	data := []byte(`{
+  "invocations": [
+    {
+      "request_id": "req-legacy",
+      "timestamp": "2026-02-25T10:00:00Z",
+      "log_lines": ["hello"]
+    }
+  ]
+}`)
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadSnapshot(tmpFile)
+	if err != nil {
+		t.Fatalf("loadSnapshot error: %v", err)
+	}
+	if len(loaded.Invocations) != 1 || loaded.Invocations[0].RequestID != "req-legacy" {
+		t.Fatalf("loaded invocations = %+v, want legacy invocation", loaded.Invocations)
+	}
+}
+
 func TestRunCompare(t *testing.T) {
 	snapA := Snapshot{
 		FunctionName: "test-func",
@@ -299,6 +338,24 @@ func TestRunCompare_FileNotFound(t *testing.T) {
 	err := runCompare("/nonexistent/a.json", "/nonexistent/b.json")
 	if err == nil {
 		t.Error("expected error for missing file")
+	}
+}
+
+func TestRunCompare_RejectsNonSnapshotJSON(t *testing.T) {
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "a.json")
+	fileB := filepath.Join(dir, "b.json")
+	if err := os.WriteFile(fileA, []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	writeSnapshotFile(t, fileB, Snapshot{FunctionName: "test-func", LogGroup: "/aws/lambda/test-func"})
+
+	err := runCompare(fileA, fileB)
+	if err == nil {
+		t.Fatal("expected invalid snapshot error")
+	}
+	if !strings.Contains(err.Error(), "load "+fileA+": invalid snapshot") {
+		t.Fatalf("runCompare error = %q, want load path and invalid snapshot message", err.Error())
 	}
 }
 
@@ -645,6 +702,105 @@ func TestRunCompare_FailOnRegressionFailsOnNewErrorPattern(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "1 new error pattern(s)") {
 		t.Fatalf("error missing new pattern count: %v", err)
+	}
+}
+
+func TestRunCompare_FailsConfiguredDurationAndMemoryGates(t *testing.T) {
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "a.json")
+	fileB := filepath.Join(dir, "b.json")
+	writeSnapshotFile(t, fileA, Snapshot{
+		FunctionName: "func-a",
+		LogGroup:     "/aws/lambda/func-a",
+		Invocations: []InvocationRecord{
+			{RequestID: "req-a", Timestamp: "2026-02-25T10:00:00Z", Duration: "100 ms", MaxMemoryUsedMB: "80 MB"},
+		},
+	})
+	writeSnapshotFile(t, fileB, Snapshot{
+		FunctionName: "func-a",
+		LogGroup:     "/aws/lambda/func-a",
+		Invocations: []InvocationRecord{
+			{RequestID: "req-b", Timestamp: "2026-02-25T10:01:00Z", Duration: "150 ms", MaxMemoryUsedMB: "100 MB"},
+		},
+	})
+
+	var err error
+	output := captureStdout(t, func() {
+		err = runCompareWithOptions(fileA, fileB, CompareOptions{
+			MaxDurationRegressionPercent:   20,
+			MaxMemoryUsedRegressionPercent: 10,
+		})
+	})
+	if err == nil {
+		t.Fatal("expected configured regression gate error")
+	}
+	for _, want := range []string{
+		"p90 duration increased by 50.0% (100.0ms to 150.0ms), over 20.0% limit",
+		"max memory used increased by 25.0% (80MB to 100MB), over 10.0% limit",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error missing %q: %v", want, err)
+		}
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestRunCompare_JSONOutput(t *testing.T) {
+	output := captureStdout(t, func() {
+		if err := runCompareWithOptions(
+			"testdata/compare_baseline.json",
+			"testdata/compare_new.json",
+			CompareOptions{OutputJSON: true},
+		); err != nil {
+			t.Fatalf("runCompareWithOptions error: %v", err)
+		}
+	})
+	if strings.Contains(output, "=== Comparison") {
+		t.Fatalf("JSON output included human report: %s", output)
+	}
+
+	var summary compareSummary
+	if err := json.Unmarshal([]byte(output), &summary); err != nil {
+		t.Fatalf("failed to unmarshal JSON output: %v\n%s", err, output)
+	}
+	if summary.Title != "test-func" {
+		t.Fatalf("title = %q, want test-func", summary.Title)
+	}
+	if summary.Errors.BaselineCount != 1 || summary.Errors.NewCount != 1 {
+		t.Fatalf("error counts = %+v, want 1 and 1", summary.Errors)
+	}
+	if len(summary.Errors.NewPatterns) != 1 || summary.Errors.NewPatterns[0] != "panic: boom" {
+		t.Fatalf("new error patterns = %v, want panic: boom", summary.Errors.NewPatterns)
+	}
+	if summary.Duration.Baseline.Count != 1 || summary.Duration.Baseline.IgnoredMalformed != 1 {
+		t.Fatalf("baseline duration stats = %+v, want one valid and one malformed", summary.Duration.Baseline)
+	}
+	if !summary.Regression.Detected || summary.Regression.WillFail {
+		t.Fatalf("regression summary = %+v, want detected without failure when fail-on-regression is off", summary.Regression)
+	}
+}
+
+func TestRunCompare_JSONOutputBeforeRegressionError(t *testing.T) {
+	var err error
+	output := captureStdout(t, func() {
+		err = runCompareWithOptions(
+			"testdata/compare_baseline.json",
+			"testdata/compare_new.json",
+			CompareOptions{OutputJSON: true, FailOnRegression: true},
+		)
+	})
+	if err == nil {
+		t.Fatal("expected regression error")
+	}
+
+	var summary compareSummary
+	if jsonErr := json.Unmarshal([]byte(output), &summary); jsonErr != nil {
+		t.Fatalf("failed to unmarshal JSON output before error: %v\n%s", jsonErr, output)
+	}
+	if !summary.Regression.WillFail {
+		t.Fatalf("regression summary = %+v, want will_fail", summary.Regression)
 	}
 }
 

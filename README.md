@@ -12,6 +12,12 @@ Or you can install by building from source directly as follows. Go 1.25 or later
 go install github.com/naterator/lambda-deploy-log-compare@latest
 ```
 
+To check for a newer GitHub release and replace the current executable:
+
+```bash
+lambda-deploy-log-compare selfupdate
+```
+
 ## Quick Start
 
 ```bash
@@ -57,12 +63,13 @@ lambda-deploy-log-compare capture --function <name>[,<name>,...] --label <label>
 | `--out` | `.` | Output directory for snapshot JSON files |
 | `--region` | `us-west-2` | AWS region |
 | `--profile` | | AWS CLI profile name |
+| `--overwrite` | `false` | Replace an existing snapshot file with the same function and label |
 
 Log groups are derived as `/aws/lambda/<function-name>`.
 
 Duplicate function names are rejected so one capture run cannot silently rescan the same Lambda and overwrite the same snapshot path.
 
-Output files are named from sanitized `<function-name>_<label>.json` components in the output directory. Path separators and traversal-style input such as `..` are rewritten so snapshot writes stay inside the chosen output directory. Each function gets its own snapshot file, and the output directory is created automatically when a snapshot is written.
+Output files are named from sanitized `<function-name>_<label>.json` components in the output directory. Path separators and traversal-style input such as `..` are rewritten so snapshot writes stay inside the chosen output directory. Each function gets its own snapshot file, and the output directory is created automatically when a snapshot is written. Existing snapshot files are not replaced unless `--overwrite` is set.
 
 The `--offset` flag lets you look further back in time. For example, `--offset 100 --count 20` skips the 100 most recent invocations and captures the 20 after that. This is useful for grabbing a historical baseline to compare against.
 
@@ -82,16 +89,36 @@ lambda-deploy-log-compare compare --a <baseline.json> --b <new.json> [options]
 | `--b` | | Path to new snapshot JSON file (required) |
 | `--strict` | `false` | Fail if either snapshot is missing `function_name` / `log_group`, or if those fields disagree |
 | `--fail-on-regression` | `false` | Exit non-zero if the new snapshot has more errors or new error patterns |
+| `--max-duration-regression-pct` | `0` | Exit non-zero if new p90 duration exceeds baseline p90 by more than this percentage. `0` disables this gate. |
+| `--max-memory-regression-pct` | `0` | Exit non-zero if new max peak memory exceeds baseline max peak memory by more than this percentage. `0` disables this gate. |
+| `--json` | `false` | Print a machine-readable JSON comparison summary instead of the human report |
 
 The comparison includes:
 
 - **Error count** — warns if errors increased
 - **Error patterns** — new patterns that appeared, old patterns that disappeared
-- **Regression gate** — `--fail-on-regression` returns a non-zero exit after printing the report if errors increased or new error patterns appeared
+- **Regression gates** — `--fail-on-regression` returns a non-zero exit after printing the report if errors increased or new error patterns appeared; the duration and memory threshold flags also return non-zero when their configured gates are exceeded
 - **Duration stats** — min, avg, p50, p90, max (in milliseconds), ignoring malformed values with an explicit ignored count
 - **Memory usage** — min, avg, max peak memory (in MB), ignoring malformed values with an explicit ignored count
-- **Log pattern diff** — new and gone log line patterns (UUIDs normalized)
+- **Log pattern diff** — new and gone log line patterns, normalizing request-specific values such as UUIDs, request IDs, timestamps, ARNs, long numeric IDs, and durations
+- **JSON output** — `--json` emits counts, pattern diffs, metric stats, warnings, and regression reasons for CI consumers
 - **Snapshot mismatch warnings** — warns when the two files appear to be from different Lambda functions or log groups; `--strict` also fails when snapshot identity fields are missing
+
+### `selfupdate`
+
+Checks the latest GitHub release, downloads the matching binary and `.sha256` checksum for the current OS/architecture, verifies the checksum, and replaces the running executable when a newer release is available.
+
+```
+lambda-deploy-log-compare selfupdate
+```
+
+### `version`
+
+Prints the current build version and exits. Release builds can set this with `-ldflags "-X main.appVersion=v1.2.3"`.
+
+```
+lambda-deploy-log-compare version
+```
 
 ## Snapshot Format
 
@@ -104,6 +131,7 @@ Important field notes:
 - `max_memory_used_mb` stores Lambda `Max Memory Used`, which is the value used for memory comparison stats and `peak_mem` in compare output.
 - Invocations that never emit a `REPORT` line are still captured, with blank duration and memory fields, so crashes and truncated runs are not silently dropped.
 - Older snapshots that used `mem_used_mb` and `max_mem_mb` still load correctly.
+- Compare rejects files that have neither snapshot metadata nor invocation records, so unrelated JSON is not treated as an empty snapshot.
 
 ## AWS Authentication
 
@@ -117,10 +145,10 @@ The IAM principal needs these permissions:
 ## How It Works
 
 1. **Stream discovery** — Fetches recent log streams ordered by last event time (most recent first) page by page until the requested `offset + count` is satisfied or the log group is exhausted.
-2. **Invocation parsing** — Reads each stream from newest events backward, tracks invocations from Lambda `START` and `REPORT` markers, and uses inline `RequestId` hints plus current stream context to associate log lines that land outside the normal `START -> logs -> REPORT` sequence. Extracts duration, billed duration, memory size, and max memory used from `REPORT` lines when present, while still preserving recent invocations that crashed or were truncated before `REPORT`. Each stream gets a 30-second timeout, and collection stops early once enough invocations are found.
+2. **Invocation parsing** — Reads each stream from newest events backward, tracks invocations from Lambda `START` and `REPORT` markers, and uses inline `RequestId` hints plus current stream context to associate log lines that land outside the normal `START -> logs -> REPORT` sequence. Extracts duration, billed duration, memory size, and max memory used from `REPORT` lines when present, while still preserving recent invocations that crashed or were truncated before `REPORT`. Each stream gets a 30-second timeout, collection stops early once enough newest invocations have their `START` boundary in the collected pages, and pages fetched before a later stream read failure are still used with a warning.
 3. **Error detection** — Flags explicit error-style log lines such as `error`, `panic`, `fatal`, `traceback`, `exception`, and Lambda runtime failure messages, while skipping common benign counter-style phrases like `error_count=0`.
 4. **Snapshot selection** — From all discovered invocations (sorted by time, most recent first), skips the first `offset` invocations, then takes the next `count`.
-5. **Pattern normalization** — For comparison, log lines are normalized by collapsing UUID-like hex strings (32+ chars) to `<UUID>` and truncating to 100 characters. This lets you compare structural patterns rather than exact values.
+5. **Pattern normalization** — For comparison, log lines are normalized by collapsing request-specific values such as UUID-like hex strings (32+ chars), Lambda request IDs, timestamps, ARNs, long numeric IDs, and durations before truncating to 100 characters. This lets you compare structural patterns rather than exact values.
 
 ## Project Structure
 

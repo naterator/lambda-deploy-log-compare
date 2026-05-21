@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,11 +24,19 @@ type LogsClient interface {
 
 const logEventsPageLimit int32 = 10_000
 
+type CaptureOptions struct {
+	Overwrite bool
+}
+
 func logGroupForFunction(name string) string {
 	return "/aws/lambda/" + name
 }
 
 func runCapture(client LogsClient, funcName, logGroup string, count, offset int, label, outDir string) error {
+	return runCaptureWithOptions(client, funcName, logGroup, count, offset, label, outDir, CaptureOptions{})
+}
+
+func runCaptureWithOptions(client LogsClient, funcName, logGroup string, count, offset int, label, outDir string, opts CaptureOptions) error {
 	if count <= 0 {
 		return fmt.Errorf("count must be greater than 0")
 	}
@@ -74,8 +83,11 @@ func runCapture(client LogsClient, funcName, logGroup string, count, offset int,
 			events, err := fetchLogEvents(evCtx, client, logGroup, *stream.LogStreamName, needed-len(allInvocations))
 			evCancel()
 			if err != nil {
-				fmt.Fprintf(stderr, "  Warning: failed to get events from stream %s: %v\n", *stream.LogStreamName, err)
-				continue
+				if len(events) == 0 {
+					fmt.Fprintf(stderr, "  Warning: failed to get events from stream %s: %v\n", *stream.LogStreamName, err)
+					continue
+				}
+				fmt.Fprintf(stderr, "  Warning: failed to get complete events from stream %s: %v; using %d event(s) fetched before the failure\n", *stream.LogStreamName, err, len(events))
 			}
 
 			invocations := parseInvocations(events)
@@ -126,12 +138,33 @@ func runCapture(client LogsClient, funcName, logGroup string, count, offset int,
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
 	}
-	if err := os.WriteFile(outPath, data, 0644); err != nil {
+	if err := writeSnapshotOutputFile(outPath, data, opts.Overwrite); err != nil {
 		return fmt.Errorf("write snapshot: %w", err)
 	}
 
 	fmt.Fprintf(stdout, "  Wrote snapshot to %s (%d invocations)\n", outPath, len(records))
 	return nil
+}
+
+func writeSnapshotOutputFile(path string, data []byte, overwrite bool) error {
+	if overwrite {
+		return os.WriteFile(path, data, 0644)
+	}
+
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("snapshot already exists at %s; use --overwrite to replace it", path)
+		}
+		return err
+	}
+
+	_, writeErr := file.Write(data)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
 }
 
 func fetchLogStreamPage(ctx context.Context, client LogsClient, logGroup string, limit int32, nextToken *string) ([]types.LogStream, *string, error) {
@@ -181,7 +214,7 @@ func fetchLogEvents(ctx context.Context, client LogsClient, logGroup, streamName
 			eventPages = append(eventPages, pageEvents)
 			tracker.addPage(pageEvents)
 
-			if tracker.count() >= neededInvocations {
+			if tracker.hasCompleteNewest(neededInvocations) {
 				break
 			}
 		}
@@ -208,11 +241,17 @@ func flattenLogEventPages(pages [][]types.OutputLogEvent) []types.OutputLogEvent
 }
 
 type invocationCompletenessTracker struct {
-	seen map[string]struct{}
+	observations map[string]*invocationObservation
+}
+
+type invocationObservation struct {
+	requestID string
+	firstSeen time.Time
+	hasStart  bool
 }
 
 func newInvocationCompletenessTracker() *invocationCompletenessTracker {
-	return &invocationCompletenessTracker{seen: make(map[string]struct{})}
+	return &invocationCompletenessTracker{observations: make(map[string]*invocationObservation)}
 }
 
 func (t *invocationCompletenessTracker) addPage(events []types.OutputLogEvent) {
@@ -223,38 +262,80 @@ func (t *invocationCompletenessTracker) addPage(events []types.OutputLogEvent) {
 			continue
 		}
 		msg := strings.TrimSpace(*ev.Message)
+		ts := time.UnixMilli(*ev.Timestamp)
 
 		switch {
 		case strings.HasPrefix(msg, "START RequestId: "):
 			currentReqID = extractRequestID(msg, "START RequestId: ")
-			t.mark(currentReqID)
+			t.markStart(currentReqID, ts)
 
 		case strings.HasPrefix(msg, "END RequestId: "):
 			currentReqID = extractRequestID(msg, "END RequestId: ")
+			t.observe(currentReqID, ts)
 
 		case strings.HasPrefix(msg, "REPORT RequestId: "):
 			currentReqID = extractRequestID(msg, "REPORT RequestId: ")
-			t.mark(currentReqID)
+			t.observe(currentReqID, ts)
 
 		default:
 			if reqID := extractInlineRequestID(msg); reqID != "" {
-				t.mark(reqID)
+				t.observe(reqID, ts)
 				continue
 			}
-			t.mark(currentReqID)
+			t.observe(currentReqID, ts)
 		}
 	}
 }
 
-func (t *invocationCompletenessTracker) mark(reqID string) {
-	if reqID == "" {
+func (t *invocationCompletenessTracker) markStart(reqID string, ts time.Time) {
+	observation := t.observe(reqID, ts)
+	if observation == nil {
 		return
 	}
-	t.seen[reqID] = struct{}{}
+	observation.hasStart = true
 }
 
-func (t *invocationCompletenessTracker) count() int {
-	return len(t.seen)
+func (t *invocationCompletenessTracker) observe(reqID string, ts time.Time) *invocationObservation {
+	if reqID == "" {
+		return nil
+	}
+	observation, ok := t.observations[reqID]
+	if !ok {
+		observation = &invocationObservation{requestID: reqID, firstSeen: ts}
+		t.observations[reqID] = observation
+		return observation
+	}
+	if observation.firstSeen.IsZero() || ts.Before(observation.firstSeen) {
+		observation.firstSeen = ts
+	}
+	return observation
+}
+
+func (t *invocationCompletenessTracker) hasCompleteNewest(needed int) bool {
+	if needed <= 0 {
+		needed = 1
+	}
+	if len(t.observations) < needed {
+		return false
+	}
+
+	observations := make([]*invocationObservation, 0, len(t.observations))
+	for _, observation := range t.observations {
+		observations = append(observations, observation)
+	}
+	sort.SliceStable(observations, func(i, j int) bool {
+		if observations[i].firstSeen.Equal(observations[j].firstSeen) {
+			return observations[i].requestID < observations[j].requestID
+		}
+		return observations[i].firstSeen.After(observations[j].firstSeen)
+	})
+
+	for i := 0; i < needed; i++ {
+		if !observations[i].hasStart {
+			return false
+		}
+	}
+	return true
 }
 
 func reverseLogEvents(events []types.OutputLogEvent) {
