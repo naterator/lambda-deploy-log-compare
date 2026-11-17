@@ -913,9 +913,9 @@ func TestRunCompare_NoUsableDurationOrMemoryData(t *testing.T) {
 
 	for _, want := range []string{
 		"Baseline: no duration data",
-		"New     : no duration data (ignored=1 malformed)",
+		"New     : no duration data (ignored=1 malformed, missing=0)",
 		"Baseline: no memory data",
-		"New     : no memory data (ignored=1 malformed)",
+		"New     : no memory data (ignored=1 malformed, missing=0)",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("output missing %q:\n%s", want, output)

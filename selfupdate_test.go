@@ -125,8 +125,8 @@ func TestRunSelfupdateSubcommandRejectsArguments(t *testing.T) {
 	withReleaseUpdaterStub(t, stub)
 
 	code, stdoutText, stderrText := runCLI(t, []string{"selfupdate", "--bogus"})
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
+	if code != exitInvalidInput {
+		t.Fatalf("exit code = %d, want %d", code, exitInvalidInput)
 	}
 	if stub.runCalls != 0 {
 		t.Fatalf("stub updater runCalls = %d, want 0", stub.runCalls)

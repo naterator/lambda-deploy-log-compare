@@ -1,0 +1,19 @@
+{
+  "function_name": "f",
+  "log_group": "/aws/lambda/f",
+  "captured_at": "2026-01-01T00:01:00Z",
+  "label": "baseline",
+  "invocations": [
+    {
+      "request_id": "req-1",
+      "timestamp": "2026-01-01T00:00:00.123Z",
+      "duration": "10 ms",
+      "billed_ms": "11 ms",
+      "is_error": false,
+      "error_lines": [],
+      "log_lines": [],
+      "mem_used_mb": "128 MB",
+      "max_mem_mb": "40 MB"
+    }
+  ]
+}

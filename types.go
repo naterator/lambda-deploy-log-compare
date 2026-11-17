@@ -6,6 +6,8 @@ import (
 )
 
 type InvocationSummary struct {
+	HasStart        bool
+	HasReport       bool
 	RequestID       string
 	StartTime       time.Time
 	Duration        string
@@ -18,14 +20,18 @@ type InvocationSummary struct {
 }
 
 type Snapshot struct {
-	FunctionName string             `json:"function_name"`
-	LogGroup     string             `json:"log_group"`
-	CapturedAt   string             `json:"captured_at"`
-	Label        string             `json:"label"`
-	Invocations  []InvocationRecord `json:"invocations"`
+	SchemaVersion int                `json:"schema_version,omitempty"`
+	ToolVersion   string             `json:"tool_version,omitempty"`
+	Capture       *CaptureMetadata   `json:"capture,omitempty"`
+	FunctionName  string             `json:"function_name"`
+	LogGroup      string             `json:"log_group"`
+	CapturedAt    string             `json:"captured_at"`
+	Label         string             `json:"label"`
+	Invocations   []InvocationRecord `json:"invocations"`
 }
 
 type InvocationRecord struct {
+	Completion      *InvocationCompletion
 	RequestID       string
 	Timestamp       string
 	Duration        string
@@ -38,21 +44,23 @@ type InvocationRecord struct {
 }
 
 type invocationRecordJSON struct {
-	RequestID       string   `json:"request_id"`
-	Timestamp       string   `json:"timestamp"`
-	Duration        string   `json:"duration"`
-	BilledMs        string   `json:"billed_ms"`
-	MemorySizeMB    string   `json:"memory_size_mb,omitempty"`
-	MaxMemoryUsedMB string   `json:"max_memory_used_mb,omitempty"`
-	LegacyMemUsedMB string   `json:"mem_used_mb,omitempty"`
-	LegacyMaxMemMB  string   `json:"max_mem_mb,omitempty"`
-	IsError         bool     `json:"is_error"`
-	ErrorLines      []string `json:"error_lines,omitempty"`
-	LogLines        []string `json:"log_lines"`
+	Completion      *InvocationCompletion `json:"completion,omitempty"`
+	RequestID       string                `json:"request_id"`
+	Timestamp       string                `json:"timestamp"`
+	Duration        string                `json:"duration"`
+	BilledMs        string                `json:"billed_ms"`
+	MemorySizeMB    string                `json:"memory_size_mb,omitempty"`
+	MaxMemoryUsedMB string                `json:"max_memory_used_mb,omitempty"`
+	LegacyMemUsedMB string                `json:"mem_used_mb,omitempty"`
+	LegacyMaxMemMB  string                `json:"max_mem_mb,omitempty"`
+	IsError         bool                  `json:"is_error"`
+	ErrorLines      []string              `json:"error_lines"`
+	LogLines        []string              `json:"log_lines"`
 }
 
 func (r InvocationRecord) MarshalJSON() ([]byte, error) {
 	return json.Marshal(invocationRecordJSON{
+		Completion:      r.Completion,
 		RequestID:       r.RequestID,
 		Timestamp:       r.Timestamp,
 		Duration:        r.Duration,
@@ -60,8 +68,8 @@ func (r InvocationRecord) MarshalJSON() ([]byte, error) {
 		MemorySizeMB:    r.MemorySizeMB,
 		MaxMemoryUsedMB: r.MaxMemoryUsedMB,
 		IsError:         r.IsError,
-		ErrorLines:      r.ErrorLines,
-		LogLines:        r.LogLines,
+		ErrorLines:      nonNil(r.ErrorLines),
+		LogLines:        nonNil(r.LogLines),
 	})
 }
 
@@ -72,6 +80,7 @@ func (r *InvocationRecord) UnmarshalJSON(data []byte) error {
 	}
 
 	*r = InvocationRecord{
+		Completion:      raw.Completion,
 		RequestID:       raw.RequestID,
 		Timestamp:       raw.Timestamp,
 		Duration:        raw.Duration,

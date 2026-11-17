@@ -1,36 +1,38 @@
-name: Build
+name: Build Release
 
 on:
   release:
     types: [created]
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+    with:
+      version: ${{ github.event.release.tag_name }}
+
   build-release-binaries:
-    name: Build Release Binaries
+    name: Build, verify, and upload all release assets
+    needs: validate
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goos: [darwin, freebsd, linux, netbsd, openbsd]
-        goarch: [amd64, arm64]
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Build
-        uses: wangyoucao577/go-release-action@v1
-        env:
-          CGO_ENABLED: 0
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          goos: ${{ matrix.goos }}
-          goarch: ${{ matrix.goarch }}
-          ldflags: -s -w -X main.appVersion=${{ github.event.release.tag_name }}
-          build_flags: -trimpath
-          overwrite: true
-          sha256sum: true
-          md5sum: false
-          asset_name: lambda-deploy-log-compare-${{ matrix.goos }}-${{ matrix.goarch }}
-          compress_assets: false
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+      - name: Build and verify all targets before uploading any
+        env:
+          RELEASE_VERSION: ${{ github.event.release.tag_name }}
+        run: bash scripts/build-release.sh "$RELEASE_VERSION" "$RUNNER_TEMP/release-assets"
+      - name: Upload verified binary and checksum pairs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_VERSION" "$RUNNER_TEMP"/release-assets/* --clobber

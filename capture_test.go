@@ -526,10 +526,14 @@ func TestRunCapture_NoStreams(t *testing.T) {
 		t.Fatalf("runCapture error: %v", err)
 	}
 
-	// No file should be written when there are no streams
+	// Persist the empty outcome so downstream automation cannot lose the function.
 	outPath := filepath.Join(outDir, "empty-func_test.json")
-	if _, err := os.Stat(outPath); !os.IsNotExist(err) {
-		t.Error("expected no output file when no streams found")
+	snap, err := loadSnapshot(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Capture == nil || snap.Capture.Complete || len(snap.Invocations) != 0 {
+		t.Fatalf("incorrect empty capture: %+v", snap)
 	}
 }
 

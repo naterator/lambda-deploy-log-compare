@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,7 +24,8 @@ type LogsClient interface {
 const logEventsPageLimit int32 = 10_000
 
 type CaptureOptions struct {
-	Overwrite bool
+	Overwrite       bool
+	RequireComplete bool
 }
 
 func logGroupForFunction(name string) string {
@@ -43,6 +43,9 @@ func runCaptureWithOptions(client LogsClient, funcName, logGroup string, count, 
 	if offset < 0 {
 		return fmt.Errorf("offset must be greater than or equal to 0")
 	}
+	if err := validateSnapshotDestination(filepath.Join(outDir, snapshotFileName(funcName, label)), opts.Overwrite); err != nil {
+		return err
+	}
 
 	ctx := context.Background()
 	needed := offset + count
@@ -57,13 +60,17 @@ func runCaptureWithOptions(client LogsClient, funcName, logGroup string, count, 
 	var streamCount int
 	var processedStreams int
 	var nextToken *string
+	metadata := &CaptureMetadata{RequestedCount: count, Offset: offset, SelectionMode: "stream_tail", Diagnostics: []Diagnostic{}, FailedStreams: []string{}}
+	var captureErr error
 
 	for len(allInvocations) < needed {
 		streamCtx, streamCancel := context.WithTimeout(ctx, 2*time.Minute)
 		streams, newToken, err := fetchLogStreamPage(streamCtx, client, logGroup, 50, nextToken)
 		streamCancel()
 		if err != nil {
-			return fmt.Errorf("describe-log-streams: %w", err)
+			captureErr = fmt.Errorf("describe-log-streams: %w", err)
+			metadata.Diagnostics = append(metadata.Diagnostics, Diagnostic{Code: "stream_discovery_failed", Message: captureErr.Error()})
+			break
 		}
 		if len(streams) == 0 {
 			break
@@ -83,6 +90,8 @@ func runCaptureWithOptions(client LogsClient, funcName, logGroup string, count, 
 			events, err := fetchLogEvents(evCtx, client, logGroup, *stream.LogStreamName, needed-len(allInvocations))
 			evCancel()
 			if err != nil {
+				metadata.FailedStreams = append(metadata.FailedStreams, *stream.LogStreamName)
+				metadata.Diagnostics = append(metadata.Diagnostics, Diagnostic{Code: "stream_read_failed", Message: err.Error(), Stream: *stream.LogStreamName})
 				if len(events) == 0 {
 					fmt.Fprintf(stderr, "  Warning: failed to get events from stream %s: %v\n", *stream.LogStreamName, err)
 					continue
@@ -94,6 +103,9 @@ func runCaptureWithOptions(client LogsClient, funcName, logGroup string, count, 
 			allInvocations = append(allInvocations, invocations...)
 
 			if len(allInvocations) >= needed {
+				if processedStreams < streamCount || newToken != nil {
+					metadata.Diagnostics = append(metadata.Diagnostics, Diagnostic{Code: "approximate_selection", Message: "collection stopped before all candidate streams were considered"})
+				}
 				fmt.Fprintf(stdout, "  Collected enough invocations (%d >= %d), stopping early after stream %d\n", len(allInvocations), needed, processedStreams)
 				break
 			}
@@ -106,9 +118,10 @@ func runCaptureWithOptions(client LogsClient, funcName, logGroup string, count, 
 	}
 	if streamCount == 0 {
 		fmt.Fprintf(stdout, "  No log streams found for %s\n", logGroup)
-		return nil
+		metadata.Diagnostics = append(metadata.Diagnostics, Diagnostic{Code: "no_streams", Message: "no log streams were available"})
 	}
-	fmt.Fprintf(stdout, "  Scanned %d log streams\n", streamCount)
+	metadata.ScannedStreams = processedStreams
+	fmt.Fprintf(stdout, "  Scanned %d log streams\n", processedStreams)
 
 	selectedInvocations := selectInvocations(allInvocations, count, offset)
 	if offset > 0 && len(selectedInvocations) == 0 {
@@ -120,14 +133,28 @@ func runCaptureWithOptions(client LogsClient, funcName, logGroup string, count, 
 	var records []InvocationRecord
 	for _, inv := range selectedInvocations {
 		records = append(records, toRecord(inv))
+		if !inv.HasStart || !inv.HasReport {
+			metadata.PartialInvocations++
+		}
 	}
+	metadata.SelectedCount = len(records)
+	if len(records) < count {
+		metadata.Diagnostics = append(metadata.Diagnostics, Diagnostic{Code: "sample_shortfall", Message: fmt.Sprintf("requested %d invocations after offset %d; selected %d", count, offset, len(records))})
+	}
+	if metadata.PartialInvocations > 0 {
+		metadata.Diagnostics = append(metadata.Diagnostics, Diagnostic{Code: "partial_invocations", Message: fmt.Sprintf("%d selected invocations are missing START or REPORT boundaries", metadata.PartialInvocations)})
+	}
+	metadata.Complete = len(metadata.Diagnostics) == 0
 
 	snapshot := Snapshot{
-		FunctionName: funcName,
-		LogGroup:     logGroup,
-		CapturedAt:   time.Now().UTC().Format(time.RFC3339),
-		Label:        label,
-		Invocations:  records,
+		SchemaVersion: currentSchemaVersion,
+		ToolVersion:   appVersion,
+		Capture:       metadata,
+		FunctionName:  funcName,
+		LogGroup:      logGroup,
+		CapturedAt:    time.Now().UTC().Format(time.RFC3339),
+		Label:         label,
+		Invocations:   records,
 	}
 
 	outPath := filepath.Join(outDir, snapshotFileName(funcName, label))
@@ -143,28 +170,13 @@ func runCaptureWithOptions(client LogsClient, funcName, logGroup string, count, 
 	}
 
 	fmt.Fprintf(stdout, "  Wrote snapshot to %s (%d invocations)\n", outPath, len(records))
+	if captureErr != nil {
+		return captureErr
+	}
+	if opts.RequireComplete && !metadata.Complete {
+		return &commandError{Exit: exitInsufficientData, Code: "capture_incomplete", Cause: fmt.Errorf("capture incomplete: %s", metadata.Diagnostics[0].Message)}
+	}
 	return nil
-}
-
-func writeSnapshotOutputFile(path string, data []byte, overwrite bool) error {
-	if overwrite {
-		return os.WriteFile(path, data, 0644)
-	}
-
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("snapshot already exists at %s; use --overwrite to replace it", path)
-		}
-		return err
-	}
-
-	_, writeErr := file.Write(data)
-	closeErr := file.Close()
-	if writeErr != nil {
-		return writeErr
-	}
-	return closeErr
 }
 
 func fetchLogStreamPage(ctx context.Context, client LogsClient, logGroup string, limit int32, nextToken *string) ([]types.LogStream, *string, error) {
@@ -395,8 +407,9 @@ func selectInvocations(allInvocations []InvocationSummary, count, offset int) []
 
 func toRecord(inv InvocationSummary) InvocationRecord {
 	return InvocationRecord{
+		Completion:      newInvocationCompletion(inv.HasStart, inv.HasReport),
 		RequestID:       inv.RequestID,
-		Timestamp:       inv.StartTime.UTC().Format(time.RFC3339),
+		Timestamp:       inv.StartTime.UTC().Format(time.RFC3339Nano),
 		Duration:        inv.Duration,
 		BilledMs:        inv.BilledMs,
 		MemorySizeMB:    inv.MemorySizeMB,

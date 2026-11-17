@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -9,12 +11,17 @@ import (
 )
 
 var (
-	requestIDPattern   = regexp.MustCompile(`(?i)\b(request[_-]?id|requestid)\b([":'\s]*[:=]\s*["']?)[A-Za-z0-9._:/+=-]+`)
-	arnPattern         = regexp.MustCompile(`arn:aws[a-zA-Z-]*:[^\s,;\]\)"]+`)
-	rfc3339TimePattern = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}[T ][0-9:.]+(?:Z|[+-]\d{2}:?\d{2})?\b`)
-	slashTimePattern   = regexp.MustCompile(`\b\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\b`)
-	durationPattern    = regexp.MustCompile(`\b\d+(?:\.\d+)?\s*(?:ms|msec|s|sec|secs|seconds)\b`)
-	longNumberPattern  = regexp.MustCompile(`\b\d{6,}\b`)
+	requestIDPattern     = regexp.MustCompile(`(?i)\b(request[_-]?id|requestid)\b([":'\s]*[:=]\s*["']?)[A-Za-z0-9._:/+=-]+`)
+	arnPattern           = regexp.MustCompile(`arn:aws[a-zA-Z-]*:[^\s,;\]\)"]+`)
+	rfc3339TimePattern   = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}[T ][0-9:.]+(?:Z|[+-]\d{2}:?\d{2})?\b`)
+	slashTimePattern     = regexp.MustCompile(`\b\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\b`)
+	durationPattern      = regexp.MustCompile(`\b\d+(?:\.\d+)?\s*(?:ms|msec|s|sec|secs|seconds)\b`)
+	longNumberPattern    = regexp.MustCompile(`\b\d{6,}\b`)
+	reportFieldPattern   = regexp.MustCompile(`(?:^|\s)(RequestId|Billed Duration|Init Duration|Restore Duration|Duration|Memory Size|Max Memory Used|Status|Error Type|ErrorType|Version|XRAY TraceId|SegmentId|Sampled):\s*`)
+	severityPattern      = regexp.MustCompile(`(?i)(?:^|[\s,{])(?:["']?(?:level|severity)["']?\s*[:=]\s*["']?(?:error|fatal|panic|critical)\b)|\[(?:error|fatal|panic|critical)\]|(?:^|[\s;])(?:error|panic|fatal|critical):`)
+	errorCounterPattern  = regexp.MustCompile(`(?i)\b(?:error_count|error count|errors?)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\b`)
+	benignCounterPattern = regexp.MustCompile(`^(?:info[:\s]+)?(?:error_count|error count|errors?|error rate)\s*[:=]\s*0(?:\.0+)?\s*%?\s*$`)
+	benignPhrasePattern  = regexp.MustCompile(`^(?:no errors?|without errors?)(?: detected(?: in prior batch)?| occurred| found)?[.!]?$`)
 )
 
 func parseInvocations(events []types.OutputLogEvent) []InvocationSummary {
@@ -111,6 +118,10 @@ func parseInvocations(events []types.OutputLogEvent) []InvocationSummary {
 			b.billedMs = extractField(msg, "Billed Duration: ")
 			b.memorySizeMB = extractField(msg, "Memory Size: ")
 			b.maxMemoryUsedMB = extractField(msg, "Max Memory Used: ")
+			if reason := reportFailureReason(extractField(msg, "Status: "), firstNonEmpty(extractField(msg, "Error Type: "), extractField(msg, "ErrorType: "))); reason != "" {
+				b.isError = true
+				b.errorLines = append(b.errorLines, reason)
+			}
 			currentReqID = reqID
 
 		default:
@@ -125,6 +136,8 @@ func parseInvocations(events []types.OutputLogEvent) []InvocationSummary {
 			continue
 		}
 		results = append(results, InvocationSummary{
+			HasStart:        b.hasStart,
+			HasReport:       b.hasReport,
 			RequestID:       b.requestID,
 			StartTime:       b.startTime,
 			Duration:        b.duration,
@@ -149,16 +162,34 @@ func extractRequestID(line, prefix string) string {
 }
 
 func extractField(report, fieldName string) string {
-	idx := strings.Index(report, fieldName)
-	if idx < 0 {
+	wanted := strings.TrimSuffix(strings.TrimSpace(fieldName), ":")
+	fields := reportFieldPattern.FindAllStringSubmatchIndex(report, -1)
+	for i, field := range fields {
+		if report[field[2]:field[3]] != wanted {
+			continue
+		}
+		end := len(report)
+		if i+1 < len(fields) {
+			end = fields[i+1][0]
+		}
+		return strings.TrimSpace(report[field[1]:end])
+	}
+	return ""
+}
+
+func reportFailureReason(status, errorType string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status != "error" && status != "timeout" && status != "failed" && errorType == "" {
 		return ""
 	}
-	rest := report[idx+len(fieldName):]
-	end := strings.IndexAny(rest, "\t\n")
-	if end < 0 {
-		return strings.TrimSpace(rest)
+	if status == "" {
+		status = "error"
 	}
-	return strings.TrimSpace(rest[:end])
+	reason := fmt.Sprintf("Lambda invocation failed: status=%s", status)
+	if errorType != "" {
+		reason += " error_type=" + errorType
+	}
+	return reason
 }
 
 func extractInlineRequestID(line string) string {
@@ -172,8 +203,12 @@ func extractInlineRequestID(line string) string {
 
 func lineLooksLikeError(line string) bool {
 	lower := strings.ToLower(strings.TrimSpace(line))
-	if lower == "" || isBenignErrorLine(lower) {
+	if lower == "" || benignCounterPattern.MatchString(lower) {
 		return false
+	}
+	// Explicit severity always wins over counter or benign wording elsewhere.
+	if severityPattern.MatchString(lower) {
+		return true
 	}
 
 	for _, token := range []string{
@@ -190,6 +225,14 @@ func lineLooksLikeError(line string) bool {
 		if strings.Contains(lower, token) {
 			return true
 		}
+	}
+	for _, match := range errorCounterPattern.FindAllStringSubmatch(lower, -1) {
+		if count, err := strconv.ParseFloat(match[1], 64); err == nil && count > 0 {
+			return true
+		}
+	}
+	if isBenignErrorLine(lower) {
+		return false
 	}
 
 	for _, token := range []string{
@@ -211,25 +254,7 @@ func lineLooksLikeError(line string) bool {
 }
 
 func isBenignErrorLine(lower string) bool {
-	for _, phrase := range []string{
-		"no error",
-		"no errors",
-		"without error",
-		"without errors",
-		"error_count",
-		"error count",
-		"errors=0",
-		"error=0",
-		"errors: 0",
-		"error: 0",
-		"error rate",
-		"error budget",
-	} {
-		if strings.Contains(lower, phrase) {
-			return true
-		}
-	}
-	return false
+	return benignCounterPattern.MatchString(lower) || benignPhrasePattern.MatchString(lower)
 }
 
 func normalizeLogLine(line string) string {
@@ -241,9 +266,6 @@ func normalizeLogLine(line string) string {
 	result = durationPattern.ReplaceAllString(result, "<DURATION>")
 	result = collapseHexRuns(result, 32, "<UUID>")
 	result = longNumberPattern.ReplaceAllString(result, "<NUMBER>")
-	if len(result) > 100 {
-		result = result[:100]
-	}
 	return strings.TrimSpace(result)
 }
 

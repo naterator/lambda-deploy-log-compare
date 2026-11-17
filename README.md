@@ -46,6 +46,8 @@ If `./snapshots` does not exist yet, the tool creates it before writing snapshot
 
 ## Commands
 
+Use `--help` or `<command> --help` for help (exit status zero). Commands accept named flags; unexpected positional arguments are rejected before work starts, including arguments that would otherwise hide subsequent flags.
+
 ### `capture`
 
 Fetches CloudWatch Logs for one or more Lambda functions and saves a snapshot of invocations.
@@ -69,7 +71,9 @@ Log groups are derived as `/aws/lambda/<function-name>`.
 
 Duplicate function names are rejected so one capture run cannot silently rescan the same Lambda and overwrite the same snapshot path.
 
-Output files are named from sanitized `<function-name>_<label>.json` components in the output directory. Path separators and traversal-style input such as `..` are rewritten so snapshot writes stay inside the chosen output directory. Each function gets its own snapshot file, and the output directory is created automatically when a snapshot is written. Existing snapshot files are not replaced unless `--overwrite` is set.
+Output files are named from sanitized `<function-name>_<label>.json` components in the output directory. Path separators and traversal-style input such as `..` are rewritten. Before AWS access, capture rejects output-name collisions (including case-insensitive collisions), destination symlinks, and existing files unless `--overwrite` is set. Each function gets its own snapshot file, and the output directory is created automatically when a snapshot is written.
+
+Snapshots are staged and flushed in the output directory, then published atomically. Exclusive creation remains safe under concurrent writers; overwrite replaces the directory entry without following destination symlinks and never broadens an existing file's permissions. Failures before publication preserve the old file. A directory-flush failure after publication explicitly reports that the snapshot was already published.
 
 The `--offset` flag lets you look further back in time. For example, `--offset 100 --count 20` skips the 100 most recent invocations and captures the 20 after that. This is useful for grabbing a historical baseline to compare against.
 
@@ -88,12 +92,15 @@ lambda-deploy-log-compare compare --a <baseline.json> --b <new.json> [options]
 | `--a` | | Path to baseline snapshot JSON file (required) |
 | `--b` | | Path to new snapshot JSON file (required) |
 | `--strict` | `false` | Fail if either snapshot is missing `function_name` / `log_group`, or if those fields disagree |
+| `--strict-records` | `false` | Validate invocation IDs, timestamps, metric values, and error consistency |
 | `--fail-on-regression` | `false` | Exit non-zero if the new snapshot has more errors or new error patterns |
 | `--max-duration-regression-pct` | `0` | Exit non-zero if new p90 duration exceeds baseline p90 by more than this percentage. `0` disables this gate. |
 | `--max-memory-regression-pct` | `0` | Exit non-zero if new max peak memory exceeds baseline max peak memory by more than this percentage. `0` disables this gate. |
 | `--json` | `false` | Print a machine-readable JSON comparison summary instead of the human report |
 
 The comparison includes:
+
+Numeric thresholds must be finite and nonnegative. Malformed, negative, and non-finite snapshot metrics are excluded and counted. Relative metric gates cannot evaluate a zero baseline or an unrepresentable percentage; when enabled, these cases return nonzero with an explanation. JSON marks them with `relative_change_defined: false` rather than encoding infinity or treating the result as zero change.
 
 - **Error count** — warns if errors increased
 - **Error patterns** — new patterns that appeared, old patterns that disappeared
@@ -124,12 +131,24 @@ lambda-deploy-log-compare version
 
 Each snapshot file contains one `Snapshot` object with metadata plus an `invocations` array.
 
+New captures include `schema_version: 1` and `tool_version`. Unversioned snapshots remain readable; unknown future versions are rejected. Empty arrays serialize as `[]`. See [the snapshot/report contract](docs/snapshot-format.md) for compatibility rules and the shared design for completeness, structured logs, and provenance.
+
+Comparison JSON includes schema/tool versions, `status`, `exit_code`, and stable `regression.reason_codes`. Invalid input in JSON mode emits an error envelope with a stable `code` and diagnostic `message`. Exit statuses are: `0` success, `1` operational failure, `2` invalid input, `3` capture failure, `4` insufficient evidence under an enabled policy, and `5` regression under an enabled gate. Regression reports are printed before the nonzero exit.
+
+```bash
+lambda-deploy-log-compare compare --a baseline.json --b new.json \
+  --strict --strict-records --fail-on-regression --json > comparison.json
+```
+
+CI should retain `comparison.json` on nonzero exits and interpret its status; invalid input and a detected regression require different actions.
+
 Important field notes:
 
 - `duration` and `billed_ms` come from Lambda `REPORT` lines.
 - `memory_size_mb` stores Lambda `Memory Size`, which is the configured memory size for the function.
 - `max_memory_used_mb` stores Lambda `Max Memory Used`, which is the value used for memory comparison stats and `peak_mem` in compare output.
 - Invocations that never emit a `REPORT` line are still captured, with blank duration and memory fields, so crashes and truncated runs are not silently dropped.
+- Runtime `REPORT` statuses such as `error` and `timeout`, and runtime error types, mark an invocation as failed. A stable diagnostic is retained in `error_lines`. Explicit error severity takes precedence over benign counter wording on the same line.
 - Older snapshots that used `mem_used_mb` and `max_mem_mb` still load correctly.
 - Compare rejects files that have neither snapshot metadata nor invocation records, so unrelated JSON is not treated as an empty snapshot.
 
@@ -148,7 +167,22 @@ The IAM principal needs these permissions:
 2. **Invocation parsing** — Reads each stream from newest events backward, tracks invocations from Lambda `START` and `REPORT` markers, and uses inline `RequestId` hints plus current stream context to associate log lines that land outside the normal `START -> logs -> REPORT` sequence. Extracts duration, billed duration, memory size, and max memory used from `REPORT` lines when present, while still preserving recent invocations that crashed or were truncated before `REPORT`. Each stream gets a 30-second timeout, collection stops early once enough newest invocations have their `START` boundary in the collected pages, and pages fetched before a later stream read failure are still used with a warning.
 3. **Error detection** — Flags explicit error-style log lines such as `error`, `panic`, `fatal`, `traceback`, `exception`, and Lambda runtime failure messages, while skipping common benign counter-style phrases like `error_count=0`.
 4. **Snapshot selection** — From all discovered invocations (sorted by time, most recent first), skips the first `offset` invocations, then takes the next `count`.
-5. **Pattern normalization** — For comparison, log lines are normalized by collapsing request-specific values such as UUID-like hex strings (32+ chars), Lambda request IDs, timestamps, ARNs, long numeric IDs, and durations before truncating to 100 characters. This lets you compare structural patterns rather than exact values.
+5. **Pattern normalization** — For comparison, complete log lines are normalized by collapsing request-specific values such as UUID-like hex strings (32+ chars), Lambda request IDs, timestamps, ARNs, long numeric IDs, and durations. Pattern identity and JSON retain the full normalized line. Human reports display up to 20 entries per pattern category and truncate each entry to 120 Unicode characters; display limits never affect regression decisions.
+
+## Development and release checks
+
+Run `bash scripts/check.sh` for formatting, vet, race-enabled tests, a build, and native CLI smoke tests. CI runs this on Linux and macOS with Go 1.25.0 and the current stable toolchain. Release asset publication waits for the same checks on the release commit.
+
+`bash scripts/build-release.sh v1.2.3 /tmp/release-assets` builds every supported target into an empty directory, verifies target build metadata, generates SHA-256 checksums, and verifies all expected binary/checksum pairs before upload. The release builder uses the version in `go.mod`; toolchain changes are explicit repository changes.
+
+| OS | Release architectures | Verification |
+| --- | --- | --- |
+| Linux | amd64, arm64 | Cross-builds; native CI smoke tests on the Linux runner architecture |
+| macOS | amd64, arm64 | Cross-builds; native CI smoke tests on the macOS runner architecture |
+| FreeBSD, NetBSD, OpenBSD | amd64, arm64 | Cross-build and artifact checks |
+| Windows | None | Release binaries and self-update are unsupported |
+
+Cross-compilation does not establish runtime behavior on the BSD targets or on architectures without a native CI runner.
 
 ## Project Structure
 

@@ -18,8 +18,8 @@ import (
 
 func TestRun_ShowsUsageOnMissingCommand(t *testing.T) {
 	code, _, stderrText := runCLI(t, []string{})
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
+	if code != exitInvalidInput {
+		t.Fatalf("exit code = %d, want %d", code, exitInvalidInput)
 	}
 	if !strings.Contains(stderrText, "Usage:") {
 		t.Fatalf("stderr missing usage: %s", stderrText)
@@ -34,6 +34,7 @@ func TestRun_FlagExitPaths(t *testing.T) {
 		name       string
 		args       []string
 		wantStderr []string
+		wantCode   int
 	}{
 		{
 			name:       "capture help",
@@ -49,14 +50,15 @@ func TestRun_FlagExitPaths(t *testing.T) {
 			name:       "capture invalid flag",
 			args:       []string{"capture", "--bogus"},
 			wantStderr: []string{"flag provided but not defined", "Usage:"},
+			wantCode:   exitInvalidInput,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			code, stdoutText, stderrText := runCLI(t, tt.args)
-			if code != 1 {
-				t.Fatalf("exit code = %d, want 1", code)
+			if code != tt.wantCode {
+				t.Fatalf("exit code = %d, want %d", code, tt.wantCode)
 			}
 			if stdoutText != "" {
 				t.Fatalf("stdout = %q, want empty", stdoutText)
@@ -187,8 +189,8 @@ func TestRun_CompareStrictFlag(t *testing.T) {
 	writeSnapshotFile(t, filepath.Join(dir, "b.json"), Snapshot{FunctionName: "func-b", LogGroup: "/aws/lambda/func-b"})
 
 	code, stdoutText, stderrText := runCLI(t, []string{"compare", "--strict", "--a", filepath.Join(dir, "a.json"), "--b", filepath.Join(dir, "b.json")})
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
+	if code != exitInvalidInput {
+		t.Fatalf("exit code = %d, want %d", code, exitInvalidInput)
 	}
 	if stdoutText != "" {
 		t.Fatalf("stdout = %q, want empty", stdoutText)
@@ -205,8 +207,8 @@ func TestRun_CompareFailOnRegressionFlag(t *testing.T) {
 		"--a", "testdata/compare_baseline.json",
 		"--b", "testdata/compare_new.json",
 	})
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
+	if code != exitRegression {
+		t.Fatalf("exit code = %d, want %d", code, exitRegression)
 	}
 	if !strings.Contains(stdoutText, "*** NEW error patterns in new deployment: ***") {
 		t.Fatalf("stdout missing full compare report: %s", stdoutText)
@@ -264,8 +266,8 @@ func TestRun_CompareConfiguredRegressionGateFlag(t *testing.T) {
 		"--a", fileA,
 		"--b", fileB,
 	})
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
+	if code != exitRegression {
+		t.Fatalf("exit code = %d, want %d", code, exitRegression)
 	}
 	if !strings.Contains(stdoutText, "=== Regression Gates ===") {
 		t.Fatalf("stdout missing regression gate section: %s", stdoutText)
@@ -285,8 +287,8 @@ func TestRun_CaptureDuplicateFunctionsFails(t *testing.T) {
 	}
 
 	code, stdoutText, stderrText := runCLI(t, []string{"capture", "--function", "func-a, func-a", "--label", "baseline"})
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
+	if code != exitInvalidInput {
+		t.Fatalf("exit code = %d, want %d", code, exitInvalidInput)
 	}
 	if stdoutText != "" {
 		t.Fatalf("stdout = %q, want empty", stdoutText)
@@ -328,8 +330,8 @@ func TestRun_CaptureMultipleFunctionsReturnsFailureCount(t *testing.T) {
 		"--count", "1",
 		"--out", outDir,
 	})
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
+	if code != exitCaptureFailed {
+		t.Fatalf("exit code = %d, want %d", code, exitCaptureFailed)
 	}
 	if !strings.Contains(stdoutText, "Wrote snapshot") {
 		t.Fatalf("stdout missing successful capture: %s", stdoutText)
@@ -354,8 +356,8 @@ func TestRun_CaptureAWSClientInitFailure(t *testing.T) {
 	}
 
 	code, stdoutText, stderrText := runCLI(t, []string{"capture", "--function", "func-a", "--label", "baseline"})
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
+	if code != exitCaptureFailed {
+		t.Fatalf("exit code = %d, want %d", code, exitCaptureFailed)
 	}
 	if stdoutText != "" {
 		t.Fatalf("stdout = %q, want empty", stdoutText)

@@ -90,9 +90,9 @@ func TestNormalizeLogLine(t *testing.T) {
 			"Status code: 200 abc123",
 		},
 		{
-			"truncated to 100 chars",
+			"long pattern identity preserved",
 			"This is a very long log line that should be truncated because it exceeds the one hundred character limit that is enforced by the normalize function",
-			"This is a very long log line that should be truncated because it exceeds the one hundred character l",
+			"This is a very long log line that should be truncated because it exceeds the one hundred character limit that is enforced by the normalize function",
 		},
 		{
 			"whitespace trimmed",

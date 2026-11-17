@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -34,12 +35,16 @@ func run(args []string) int {
 	captureRegion := captureCmd.String("region", "us-west-2", "AWS region")
 	captureProfile := captureCmd.String("profile", "", "AWS CLI profile (optional)")
 	captureOverwrite := captureCmd.Bool("overwrite", false, "Replace an existing snapshot file with the same function and label")
+	captureRequireComplete := captureCmd.Bool("require-complete", false, "Fail after saving if capture is incomplete")
 
 	compareCmd := flag.NewFlagSet("compare", flag.ContinueOnError)
 	compareCmd.SetOutput(stderr)
 	compareCmd.Usage = func() { printUsage() }
 	compareFileA := compareCmd.String("a", "", "Path to first snapshot file (baseline)")
 	compareFileB := compareCmd.String("b", "", "Path to second snapshot file (new deployment)")
+	compareStrictRecords := compareCmd.Bool("strict-records", false, "Validate invocation identities, timestamps, metrics, and error consistency")
+	compareRequireComplete := compareCmd.Bool("require-complete", false, "Require verified complete capture metadata on both snapshots")
+	compareMinInvocations := compareCmd.Int("min-invocations", 0, "Require at least this many invocations and valid samples for enabled metric gates")
 	compareStrict := compareCmd.Bool("strict", false, "Fail if snapshot function names or log groups are missing or differ")
 	compareFailOnRegression := compareCmd.Bool("fail-on-regression", false, "Exit non-zero if errors increase or new error patterns appear")
 	compareOutputJSON := compareCmd.Bool("json", false, "Print a machine-readable JSON comparison summary")
@@ -48,15 +53,22 @@ func run(args []string) int {
 
 	if len(args) < 1 {
 		printUsage()
-		return 1
+		return exitInvalidInput
 	}
 
 	switch args[0] {
+	case "help", "--help", "-h":
+		printUsage()
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, "Error: help does not accept arguments")
+			return exitInvalidInput
+		}
+		return 0
 	case "version":
 		if len(args) != 1 {
 			fmt.Fprintln(stderr, "Error: version does not accept arguments")
 			printUsage()
-			return 1
+			return exitInvalidInput
 		}
 		fmt.Fprintln(stdout, appVersion)
 		return 0
@@ -65,72 +77,96 @@ func run(args []string) int {
 		if len(args) != 1 {
 			fmt.Fprintln(stderr, "Error: selfupdate does not accept arguments")
 			printUsage()
-			return 1
+			return exitInvalidInput
 		}
 		if err := makeReleaseUpdater().Run(context.Background(), appVersion, stdout); err != nil {
 			fmt.Fprintf(stderr, "selfupdate failed: %v\n", err)
-			return 1
+			return exitOperational
 		}
 		return 0
 
 	case "capture":
 		if err := captureCmd.Parse(args[1:]); err != nil {
-			return 1
+			if err == flag.ErrHelp {
+				return 0
+			}
+			return exitInvalidInput
+		}
+		if captureCmd.NArg() != 0 {
+			fmt.Fprintf(stderr, "Error: capture does not accept positional arguments: %q\n", captureCmd.Arg(0))
+			return exitInvalidInput
 		}
 		functions := parseFunctionNames(*captureFunc)
 		if err := validateCaptureInputs(functions, *captureLabel, *captureCount, *captureOffset); err != nil {
 			fmt.Fprintf(stderr, "Error: %v\n", err)
 			printUsage()
-			return 1
+			return exitInvalidInput
+		}
+		if err := validateSnapshotPaths(functions, *captureLabel, *captureOutDir, *captureOverwrite); err != nil {
+			fmt.Fprintf(stderr, "Error: %v\n", err)
+			return exitInvalidInput
 		}
 
 		client, err := logsClientFactory(*captureRegion, *captureProfile)
 		if err != nil {
 			fmt.Fprintf(stderr, "Error initializing AWS client: %v\n", err)
-			return 1
+			return exitCaptureFailed
 		}
 
 		var captureErrors int
+		captureExit := exitInsufficientData
 		for _, fn := range functions {
 			logGroup := logGroupForFunction(fn)
 			err := runCaptureWithOptions(client, fn, logGroup, *captureCount, *captureOffset, *captureLabel, *captureOutDir, CaptureOptions{
-				Overwrite: *captureOverwrite,
+				Overwrite:       *captureOverwrite,
+				RequireComplete: *captureRequireComplete,
 			})
 			if err != nil {
+				var typed *commandError
+				if !errors.As(err, &typed) || typed.Exit != exitInsufficientData {
+					captureExit = exitCaptureFailed
+				}
 				fmt.Fprintf(stderr, "Error capturing %s: %v\n", fn, err)
 				captureErrors++
 			}
 		}
 		if captureErrors > 0 {
 			fmt.Fprintf(stderr, "%d capture(s) failed\n", captureErrors)
-			return 1
+			return captureExit
 		}
 		return 0
 
 	case "compare":
 		if err := compareCmd.Parse(args[1:]); err != nil {
-			return 1
+			if err == flag.ErrHelp {
+				return 0
+			}
+			return reportCommandError(inputError("invalid_arguments", err), *compareOutputJSON)
+		}
+		if compareCmd.NArg() != 0 {
+			return reportCommandError(inputError("invalid_arguments", fmt.Errorf("compare does not accept positional arguments: %q", compareCmd.Arg(0))), *compareOutputJSON)
 		}
 		if *compareFileA == "" || *compareFileB == "" {
-			fmt.Fprintln(stderr, "Error: --a and --b are required")
 			printUsage()
-			return 1
+			return reportCommandError(inputError("invalid_arguments", fmt.Errorf("--a and --b are required")), *compareOutputJSON)
 		}
 		if err := runCompareWithOptions(*compareFileA, *compareFileB, CompareOptions{
 			Strict:                         *compareStrict,
+			StrictRecords:                  *compareStrictRecords,
+			RequireComplete:                *compareRequireComplete,
+			MinInvocations:                 *compareMinInvocations,
 			FailOnRegression:               *compareFailOnRegression,
 			OutputJSON:                     *compareOutputJSON,
 			MaxDurationRegressionPercent:   *compareMaxDurationRegression,
 			MaxMemoryUsedRegressionPercent: *compareMaxMemoryRegression,
 		}); err != nil {
-			fmt.Fprintf(stderr, "Error: %v\n", err)
-			return 1
+			return reportCommandError(err, *compareOutputJSON)
 		}
 		return 0
 
 	default:
 		printUsage()
-		return 1
+		return exitInvalidInput
 	}
 }
 
@@ -159,11 +195,19 @@ Capture options:
   --region     AWS region (default: us-west-2)
   --profile    AWS CLI profile name (optional)
   --overwrite  Replace an existing snapshot file with the same function and label
+  --require-complete
+               Fail after saving if capture is incomplete
 
 Compare options:
   --a          Path to baseline snapshot JSON file (required)
   --b          Path to new deployment snapshot JSON file (required)
   --strict     Fail if snapshot function names or log groups are missing or differ
+  --strict-records
+               Validate invocation IDs, timestamps, metrics, and error consistency
+  --require-complete
+               Require verified complete capture metadata on both snapshots
+  --min-invocations
+               Require this many invocations and valid samples for metric gates (default: 0)
   --fail-on-regression
               Fail if errors increase or new error patterns appear
   --max-duration-regression-pct
